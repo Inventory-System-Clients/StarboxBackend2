@@ -1,0 +1,1072 @@
+import express from "express";
+import {
+  Roteiro,
+  Loja,
+  Usuario,
+  Maquina,
+  Veiculo,
+  RoteiroLoja,
+  LogOrdemRoteiro,
+  RoteiroPontoPulado,
+  RoteiroFinalizacaoDiaria,
+  MovimentacaoVeiculo,
+  RoteiroExecucaoSemanal,
+} from "../models/index.js";
+import { sequelize } from "../database/connection.js";
+import { autenticar, autorizar } from "../middlewares/auth.js";
+import justificativasPendentes from "../utils/justificativasPendentes.js";
+import {
+  getDataHoje,
+  isFinalizadoNaSemana,
+  resolverContextoExecucaoSemanal,
+} from "../utils/roteiroExecucaoSemanal.js";
+import { obterStatusMaquinasConcluidasDaExecucao } from "../utils/roteiroStatusSemanal.js";
+import {
+  garantirFuncionarioPersistenteRoteiro,
+  hasFuncionarioPayload,
+  resolverAtualizacaoFuncionarioRoteiro,
+} from "../services/roteiroFuncionarioService.js";
+import {
+  finalizarRoteiro,
+  desfinalizarRoteiro,
+  criarRoteiro,
+  atualizarDiasSemana,
+  apagarRoteiro,
+  obterStatusRoteiroSemanal,
+  verAndamentoRoteiro,
+} from "../controllers/roteiroController.js";
+import {
+  listarGastosRoteiro,
+  registrarGastoRoteiro,
+  atualizarOrcamentoDiarioRoteiro,
+} from "../controllers/gastoRoteiroController.js";
+import {
+  encerrarLocalizacaoRoteiro,
+  listarLocalizacoesAtivas,
+  salvarLocalizacaoRoteiro,
+} from "../controllers/roteiroLocalizacaoController.js";
+import { Op, literal } from "sequelize";
+
+const router = express.Router();
+
+const ROLES_GESTAO_ROTEIROS = ["ADMIN", "GERENCIADOR"];
+const ROLES_OPERACAO_ROTEIRO = [
+  "FUNCIONARIO",
+  "FUNCIONARIO_TODAS_LOJAS",
+  "ABASTECEDOR",
+];
+
+const usuarioPodeAssumirExecucao = (execucao, usuarioId) => {
+  if (!execucao?.emAndamento) return true;
+  if (!execucao.usuarioId) return true;
+  return String(execucao.usuarioId) === String(usuarioId || "");
+};
+
+const roteiroFoiFinalizadoNoCicloAtual = async (roteiroId, transaction) => {
+  if (!roteiroId) return false;
+
+  const execucao = await RoteiroExecucaoSemanal.findOne({
+    where: { roteiroId },
+    transaction,
+  });
+
+  if (isFinalizadoNaSemana(execucao)) {
+    return true;
+  }
+
+  const contexto = await resolverContextoExecucaoSemanal(roteiroId);
+  const finalizacao = await RoteiroFinalizacaoDiaria.findOne({
+    where: {
+      roteiroId,
+      data: {
+        [Op.gte]: contexto.dataInicio,
+      },
+      finalizado: true,
+    },
+    transaction,
+  });
+
+  return Boolean(finalizacao);
+};
+
+const pontoFoiJustificadoNoDia = (pontoPulado) =>
+  Boolean(pontoPulado?.foiPulado && pontoPulado?.justificativaEnviada);
+
+const normalizarId = (id) => String(id || "").trim();
+
+const obterContextoOrdemRoteiro = async (roteiroId) => {
+  const lojasRoteiro = await RoteiroLoja.findAll({
+    where: { RoteiroId: roteiroId },
+    order: [["ordem", "ASC"]],
+  });
+
+  const lojaIds = lojasRoteiro.map((rel) => rel.LojaId).filter(Boolean);
+  if (lojaIds.length === 0) {
+    return [];
+  }
+
+  const lojas = await Loja.findAll({
+    where: { id: lojaIds },
+    include: [{ model: Maquina, as: "maquinas", attributes: ["id", "nome"] }],
+  });
+
+  const lojasPorId = new Map(lojas.map((loja) => [normalizarId(loja.id), loja]));
+
+  const contextoExecucao = await resolverContextoExecucaoSemanal(roteiroId);
+  const maquinaIdsRota = lojas.flatMap((loja) =>
+    (loja.maquinas || []).map((maquina) => maquina.id),
+  );
+  const { maquinasConcluidas } = await obterStatusMaquinasConcluidasDaExecucao({
+    roteiroId,
+    dataInicio: contextoExecucao.dataInicio,
+    maquinaIds: maquinaIdsRota,
+  });
+
+  return lojasRoteiro
+    .map((rel) => {
+      const loja = lojasPorId.get(normalizarId(rel.LojaId));
+      if (!loja) return null;
+
+      const lojaConcluida = (loja.maquinas || []).some((m) =>
+        maquinasConcluidas.has(m.id),
+      );
+      const temPendencia = !lojaConcluida;
+
+      return {
+        id: loja.id,
+        nome: loja.nome,
+        ordem: rel.ordem,
+        temPendencia,
+      };
+    })
+    .filter(Boolean);
+};
+
+const obterLojaEsperadaPendente = async (roteiroId) => {
+  const contexto = await obterContextoOrdemRoteiro(roteiroId);
+  return contexto.find((item) => item.temPendencia) || null;
+};
+
+// Criar novo roteiro (aceita diasSemana opcionalmente)
+router.post("/", autenticar, autorizar(ROLES_GESTAO_ROTEIROS), criarRoteiro);
+
+// Listar roteiros
+router.get("/", async (req, res) => {
+  try {
+    const roteiros = await Roteiro.findAll({
+      include: [
+        { model: Usuario, as: "funcionario", attributes: ["id", "nome", "role"] },
+        {
+          model: Veiculo,
+          as: "veiculo",
+          attributes: ["id", "nome", "modelo", "tipo", "emoji"],
+        },
+        {
+          model: Loja,
+          as: "lojas",
+          attributes: ["id", "nome"],
+          through: { attributes: ["ordem"] },
+        },
+      ],
+    });
+    res.json(roteiros);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao listar roteiros" });
+  }
+});
+
+// Iniciar roteiro
+router.post(
+  "/:id/iniciar",
+  autenticar,
+  autorizar([...ROLES_GESTAO_ROTEIROS, ...ROLES_OPERACAO_ROTEIRO]),
+  async (req, res) => {
+    try {
+      const { funcionarioId, funcionarioNome, veiculoId, kmInicialVeiculo } = req.body;
+      console.log("[INICIAR] body:", {
+        funcionarioId,
+        funcionarioNome,
+        veiculoId,
+        kmInicialVeiculo,
+      });
+      const roteiro = await Roteiro.findByPk(req.params.id);
+      if (!roteiro)
+        return res.status(404).json({ error: "Roteiro não encontrado" });
+
+      const roleAtual = req.usuario?.role;
+      const usuarioEhGestor = ROLES_GESTAO_ROTEIROS.includes(roleAtual);
+      const usuarioEhOperacao = ROLES_OPERACAO_ROTEIRO.includes(roleAtual);
+
+      if (usuarioEhOperacao && String(roteiro.funcionarioId || "") !== String(req.usuario.id)) {
+        return res.status(403).json({
+          error: "Você não é o funcionário responsável por este roteiro",
+        });
+      }
+
+      const dataHoje = getDataHoje();
+      const execucaoExistente = await RoteiroExecucaoSemanal.findOne({
+        where: { roteiroId: roteiro.id },
+      });
+
+      const roteiroFinalizadoNoCiclo = await roteiroFoiFinalizadoNoCicloAtual(
+        roteiro.id,
+      );
+      if (roteiroFinalizadoNoCiclo) {
+        return res.status(409).json({
+          error: "Este roteiro ja foi finalizado e so pode ser iniciado novamente apos o reset semanal de domingo as 21h",
+          statusRota: "finalizado_ate_reset",
+          finalizadoEm: execucaoExistente?.finalizadoEm || null,
+        });
+      }
+
+      if (!usuarioPodeAssumirExecucao(execucaoExistente, req.usuario?.id)) {
+        return res.status(409).json({
+          error: "Este roteiro ja esta em uso por outro usuario",
+          statusRota: "em_uso_por_outro_usuario",
+          usuarioId: execucaoExistente.usuarioId,
+        });
+      }
+
+      const veiculoIdNormalizado = veiculoId === "" ? null : veiculoId;
+      const veiculoIdEfetivo =
+        veiculoId !== undefined ? veiculoIdNormalizado : roteiro.veiculoId;
+      let kmInicialNumerico = null;
+      let kmInicialSemanal = null;
+      let kmInicialRegistradoEm = null;
+      let veiculoIdSemanal = null;
+      const kmInicialPersistido = Number.parseInt(
+        execucaoExistente?.kmInicialVeiculo,
+        10,
+      );
+      const kmInicialJaPersistido =
+        Number.isInteger(kmInicialPersistido) && kmInicialPersistido > 0;
+
+      if (
+        kmInicialVeiculo !== undefined &&
+        kmInicialVeiculo !== null &&
+        String(kmInicialVeiculo).trim() !== ""
+      ) {
+        const kmConvertido = Number.parseInt(kmInicialVeiculo, 10);
+        if (!Number.isInteger(kmConvertido) || kmConvertido < 0) {
+          return res.status(400).json({
+            error: "kmInicialVeiculo deve ser um número inteiro maior ou igual a zero",
+          });
+        }
+        kmInicialNumerico = kmConvertido;
+      }
+
+      if (veiculoIdEfetivo) {
+        const veiculo = await Veiculo.findByPk(veiculoIdEfetivo);
+        if (!veiculo)
+          return res.status(404).json({ error: "Veículo não encontrado" });
+
+        const retiradaDia = await MovimentacaoVeiculo.findOne({
+          where: {
+            roteiroId: roteiro.id,
+            veiculoId: veiculoIdEfetivo,
+            tipo: "retirada",
+            dataHora: {
+              [Op.between]: [
+                new Date(`${dataHoje}T00:00:00.000Z`),
+                new Date(`${dataHoje}T23:59:59.999Z`),
+              ],
+            },
+          },
+          order: [["dataHora", "ASC"]],
+        });
+
+        if (kmInicialNumerico === null && !retiradaDia && !kmInicialJaPersistido) {
+          return res.status(400).json({
+            error:
+              "kmInicialVeiculo é obrigatório para iniciar roteiro com veículo quando não existe retirada registrada no dia",
+          });
+        }
+
+        if (kmInicialNumerico !== null && !kmInicialJaPersistido) {
+          const agoraRetirada = new Date();
+          const ultimaMovimentacaoComKm = await MovimentacaoVeiculo.findOne({
+            where: {
+              veiculoId: veiculoIdEfetivo,
+              km: {
+                [Op.ne]: null,
+              },
+            },
+            order: [["dataHora", "DESC"]],
+          });
+
+          const kmAtualVeiculo = Number.parseInt(veiculo.km, 10);
+          const kmUltimaMovimentacao = Number.parseInt(
+            ultimaMovimentacaoComKm?.km,
+            10,
+          );
+
+          const kmReferencia = Math.max(
+            Number.isInteger(kmAtualVeiculo) ? kmAtualVeiculo : 0,
+            Number.isInteger(kmUltimaMovimentacao) ? kmUltimaMovimentacao : 0,
+          );
+
+          if (kmInicialNumerico < kmReferencia) {
+            return res.status(400).json({
+              error: `O KM inicial informado (${kmInicialNumerico}) não pode ser menor que o KM anterior (${kmReferencia}).`,
+              kmReferencia,
+            });
+          }
+
+          await MovimentacaoVeiculo.create({
+            veiculoId: veiculoIdEfetivo,
+            usuarioId: req.usuario.id,
+            tipo: "retirada",
+            dataHora: agoraRetirada,
+            km: kmInicialNumerico,
+            roteiroId: roteiro.id,
+            obs: "Retirada registrada no início do roteiro",
+          });
+
+          kmInicialSemanal = kmInicialNumerico;
+          kmInicialRegistradoEm = agoraRetirada;
+          veiculoIdSemanal = veiculoIdEfetivo;
+
+          if (kmInicialNumerico > Number(veiculo.km || 0)) {
+            await veiculo.update({ km: kmInicialNumerico });
+          }
+        } else if (retiradaDia?.km !== null && retiradaDia?.km !== undefined) {
+          const kmRetiradaDia = Number.parseInt(retiradaDia.km, 10);
+          if (Number.isInteger(kmRetiradaDia)) {
+            kmInicialSemanal = kmRetiradaDia;
+            kmInicialRegistradoEm = retiradaDia.dataHora || null;
+            veiculoIdSemanal = veiculoIdEfetivo;
+          }
+        }
+      }
+
+      const update = {};
+      if (usuarioEhGestor) {
+        Object.assign(
+          update,
+          await resolverAtualizacaoFuncionarioRoteiro({
+            funcionarioId,
+            funcionarioNome,
+          }),
+        );
+        if (veiculoId !== undefined) update.veiculoId = veiculoIdNormalizado;
+      }
+
+      const result =
+        Object.keys(update).length > 0 ? await roteiro.update(update) : roteiro;
+      console.log("[INICIAR] após update:", {
+        funcionarioId: result.funcionarioId,
+        funcionarioNome: result.funcionarioNome,
+        veiculoId: result.veiculoId,
+      });
+
+      if (execucaoExistente?.emAndamento) {
+        const updateExecucao = {};
+        if (!execucaoExistente.usuarioId && req.usuario?.id) {
+          updateExecucao.usuarioId = req.usuario.id;
+        }
+        if (execucaoExistente.finalizadoEm) {
+          updateExecucao.finalizadoEm = null;
+        }
+        if (
+          !kmInicialJaPersistido &&
+          Number.isInteger(kmInicialSemanal)
+        ) {
+          updateExecucao.veiculoId = veiculoIdSemanal;
+          updateExecucao.kmInicialVeiculo = kmInicialSemanal;
+          updateExecucao.kmInicialRegistradoEm = kmInicialRegistradoEm;
+        }
+        if (Object.keys(updateExecucao).length > 0) {
+          await execucaoExistente.update(updateExecucao);
+        }
+      } else if (execucaoExistente) {
+        await execucaoExistente.update({
+          usuarioId: req.usuario?.id || execucaoExistente.usuarioId || null,
+          dataInicio: dataHoje,
+          iniciadoEm: new Date(),
+          emAndamento: true,
+          finalizadoEm: null,
+          veiculoId: Number.isInteger(kmInicialSemanal) ? veiculoIdSemanal : null,
+          kmInicialVeiculo: Number.isInteger(kmInicialSemanal)
+            ? kmInicialSemanal
+            : null,
+          kmInicialRegistradoEm: Number.isInteger(kmInicialSemanal)
+            ? kmInicialRegistradoEm
+            : null,
+        });
+      } else {
+        await RoteiroExecucaoSemanal.create({
+          roteiroId: roteiro.id,
+          usuarioId: req.usuario?.id || null,
+          dataInicio: dataHoje,
+          iniciadoEm: new Date(),
+          emAndamento: true,
+          finalizadoEm: null,
+          veiculoId: Number.isInteger(kmInicialSemanal) ? veiculoIdSemanal : null,
+          kmInicialVeiculo: Number.isInteger(kmInicialSemanal)
+            ? kmInicialSemanal
+            : null,
+          kmInicialRegistradoEm: Number.isInteger(kmInicialSemanal)
+            ? kmInicialRegistradoEm
+            : null,
+        });
+      }
+
+      res.json({ success: true });
+    } catch (error) {
+      if (error.status) {
+        return res.status(error.status).json({ error: error.message });
+      }
+      console.error("[INICIAR] erro:", error);
+      res.status(500).json({ error: "Erro ao iniciar roteiro" });
+    }
+  },
+);
+
+router.get(
+  "/localizacoes-ativas",
+  autenticar,
+  (req, res, next) => {
+    if (req.usuario?.role !== "ADMIN") {
+      return res.status(403).json({
+        error: "Acesso negado. Apenas ADMIN pode visualizar localizacoes ativas.",
+      });
+    }
+    return next();
+  },
+  listarLocalizacoesAtivas,
+);
+
+router.post(
+  "/:roteiroId/localizacao",
+  autenticar,
+  salvarLocalizacaoRoteiro,
+);
+
+router.delete(
+  "/:roteiroId/localizacao",
+  autenticar,
+  encerrarLocalizacaoRoteiro,
+);
+
+// Gastos semanais no roteiro (execução)
+router.get("/:id/gastos", autenticar, listarGastosRoteiro);
+router.post("/:id/gastos", autenticar, registrarGastoRoteiro);
+
+// Orçamento semanal do roteiro (ADMIN e GERENCIADOR)
+router.patch(
+  "/:id/orcamento-semanal",
+  autenticar,
+  autorizar(ROLES_GESTAO_ROTEIROS),
+  atualizarOrcamentoDiarioRoteiro,
+);
+
+// Compatibilidade: endpoint legado de orçamento diário
+router.patch(
+  "/:id/orcamento-diario",
+  autenticar,
+  autorizar(ROLES_GESTAO_ROTEIROS),
+  atualizarOrcamentoDiarioRoteiro,
+);
+
+router.post("/:id/finalizar", autenticar, finalizarRoteiro);
+router.post("/:id/desfinalizar", autenticar, desfinalizarRoteiro);
+
+// Mover loja entre roteiros
+router.post(
+  "/mover-loja",
+  autenticar,
+  autorizar(ROLES_GESTAO_ROTEIROS),
+  async (req, res) => {
+    try {
+      const { lojaId, roteiroOrigemId, roteiroDestinoId } = req.body;
+      console.log("[MOVER-LOJA] body:", {
+        lojaId,
+        roteiroOrigemId,
+        roteiroDestinoId,
+      });
+
+      const roteiroDestino = await Roteiro.findByPk(roteiroDestinoId);
+      console.log(
+        "[MOVER-LOJA] roteiroDestino:",
+        roteiroDestino?.id ?? "NÃO ENCONTRADO",
+      );
+      if (!roteiroDestino)
+        return res
+          .status(404)
+          .json({ error: "Roteiro de destino não encontrado" });
+
+      await sequelize.transaction(async (t) => {
+        const destinoFinalizado = await roteiroFoiFinalizadoNoCicloAtual(
+          roteiroDestinoId,
+          t,
+        );
+        if (destinoFinalizado) {
+          throw Object.assign(
+            new Error(
+              "Roteiro de destino finalizado: não é permitido adicionar lojas.",
+            ),
+            { status: 409 },
+          );
+        }
+
+        if (roteiroOrigemId) {
+          const origemFinalizado = await roteiroFoiFinalizadoNoCicloAtual(
+            roteiroOrigemId,
+            t,
+          );
+          if (origemFinalizado) {
+            throw Object.assign(
+              new Error(
+                "Roteiro de origem finalizado: não é permitido remover ou mover lojas.",
+              ),
+              { status: 409 },
+            );
+          }
+
+          const roteiroOrigem = await Roteiro.findByPk(roteiroOrigemId);
+          console.log(
+            "[MOVER-LOJA] roteiroOrigem:",
+            roteiroOrigem?.id ?? "NÃO ENCONTRADO",
+          );
+          if (!roteiroOrigem)
+            throw Object.assign(new Error("Roteiro de origem não encontrado"), {
+              status: 404,
+            });
+
+          const destroyResult = await RoteiroLoja.destroy({
+            where: { RoteiroId: roteiroOrigemId, LojaId: lojaId },
+            transaction: t,
+          });
+          console.log(
+            "[MOVER-LOJA] registros removidos da origem:",
+            destroyResult,
+          );
+
+          const lojasOrigem = await RoteiroLoja.findAll({
+            where: { RoteiroId: roteiroOrigemId },
+            order: [["ordem", "ASC"]],
+            transaction: t,
+          });
+          console.log(
+            "[MOVER-LOJA] lojas restantes na origem:",
+            lojasOrigem.length,
+          );
+          for (let i = 0; i < lojasOrigem.length; i++) {
+            await lojasOrigem[i].update({ ordem: i }, { transaction: t });
+          }
+        }
+
+        const maxOrdem = await RoteiroLoja.max("ordem", {
+          where: { RoteiroId: roteiroDestinoId },
+          transaction: t,
+        });
+        const novaOrdem = maxOrdem != null ? maxOrdem + 1 : 0;
+        console.log("[MOVER-LOJA] novaOrdem no destino:", novaOrdem);
+
+        const existente = await RoteiroLoja.findOne({
+          where: { RoteiroId: roteiroDestinoId, LojaId: lojaId },
+          transaction: t,
+        });
+        console.log("[MOVER-LOJA] loja já existe no destino?", !!existente);
+
+        if (existente) {
+          await existente.update({ ordem: novaOrdem }, { transaction: t });
+        } else {
+          const criado = await RoteiroLoja.create(
+            { RoteiroId: roteiroDestinoId, LojaId: lojaId, ordem: novaOrdem },
+            { transaction: t },
+          );
+          console.log(
+            "[MOVER-LOJA] registro criado:",
+            criado?.RoteiroId,
+            criado?.LojaId,
+          );
+        }
+      });
+
+      console.log("[MOVER-LOJA] sucesso");
+      res.json({ success: true });
+    } catch (error) {
+      if (error.status === 404)
+        return res.status(404).json({ error: error.message });
+      if (error.status === 409)
+        return res.status(409).json({ error: error.message });
+      console.error("[MOVER-LOJA] ERRO COMPLETO:", error);
+      console.error("[MOVER-LOJA] message:", error.message);
+      console.error("[MOVER-LOJA] stack:", error.stack);
+      res
+        .status(500)
+        .json({
+          error: "Erro ao mover/adicionar loja",
+          detalhe: error.message,
+        });
+    }
+  },
+);
+
+// Remover loja de um roteiro (ADMIN e GERENCIADOR)
+router.delete(
+  "/:id/lojas/:lojaId",
+  autenticar,
+  autorizar(ROLES_GESTAO_ROTEIROS),
+  async (req, res) => {
+    try {
+      const { id: roteiroId, lojaId } = req.params;
+
+      const roteiroFinalizado =
+        await roteiroFoiFinalizadoNoCicloAtual(roteiroId);
+      if (roteiroFinalizado) {
+        return res.status(409).json({
+          error: "Roteiro finalizado: não é permitido remover lojas.",
+        });
+      }
+
+      const relacaoAtual = await RoteiroLoja.findOne({
+        where: { RoteiroId: roteiroId, LojaId: lojaId },
+      });
+      if (!relacaoAtual)
+        return res
+          .status(404)
+          .json({ error: "Loja não encontrada no roteiro" });
+
+      await sequelize.transaction(async (t) => {
+        await relacaoAtual.destroy({ transaction: t });
+
+        const lojasRestantes = await RoteiroLoja.findAll({
+          where: { RoteiroId: roteiroId },
+          order: [["ordem", "ASC"]],
+          transaction: t,
+        });
+        for (let i = 0; i < lojasRestantes.length; i++) {
+          await lojasRestantes[i].update({ ordem: i }, { transaction: t });
+        }
+      });
+
+      res.json({ success: true, message: "Loja removida do roteiro com sucesso" });
+    } catch (error) {
+      console.error("Erro ao remover loja do roteiro:", error);
+      res.status(500).json({ error: "Erro ao remover loja do roteiro" });
+    }
+  },
+);
+
+// Reordenar loja dentro do roteiro (ADMIN e GERENCIADOR)
+router.patch(
+  "/:id/reordenar-loja",
+  autenticar,
+  autorizar(ROLES_GESTAO_ROTEIROS),
+  async (req, res) => {
+    try {
+      const { id: roteiroId } = req.params;
+      const { lojaId, novaOrdem } = req.body;
+
+      const roteiroFinalizado = await roteiroFoiFinalizadoNoCicloAtual(roteiroId);
+      if (roteiroFinalizado) {
+        return res.status(409).json({
+          error: "Roteiro finalizado: não é permitido reordenar lojas.",
+        });
+      }
+
+      if (lojaId == null || novaOrdem == null)
+        return res
+          .status(400)
+          .json({ error: "lojaId e novaOrdem s\u00e3o obrigat\u00f3rios" });
+
+      const relacaoAtual = await RoteiroLoja.findOne({
+        where: { RoteiroId: roteiroId, LojaId: lojaId },
+      });
+      if (!relacaoAtual)
+        return res
+          .status(404)
+          .json({ error: "Loja n\u00e3o encontrada no roteiro" });
+
+      await sequelize.transaction(async (t) => {
+        const todasLojas = await RoteiroLoja.findAll({
+          where: { RoteiroId: roteiroId },
+          order: [["ordem", "ASC"]],
+          transaction: t,
+        });
+
+        // Remove a loja da posição atual e insere na nova posição
+        const semLoja = todasLojas.filter((l) => l.LojaId !== lojaId);
+        const novaOrdemClamped = Math.max(
+          0,
+          Math.min(novaOrdem, semLoja.length),
+        );
+        semLoja.splice(novaOrdemClamped, 0, relacaoAtual);
+
+        for (let i = 0; i < semLoja.length; i++) {
+          await semLoja[i].update({ ordem: i }, { transaction: t });
+        }
+      });
+
+      res.json({ success: true, message: "Loja reordenada com sucesso" });
+    } catch (error) {
+      console.error("Erro ao reordenar loja:", error);
+      res.status(500).json({ error: "Erro ao reordenar loja" });
+    }
+  },
+);
+
+// Registrar justificativa quando funcionário pula a ordem de lojas
+router.post("/:id/justificar-ordem", autenticar, async (req, res) => {
+  try {
+    const { id: roteiroId } = req.params;
+    const { lojaId, justificativa, lojaPuladaId } = req.body;
+    const usuarioId = req.usuario.id;
+
+    if (!justificativa || justificativa.trim() === "")
+      return res
+        .status(400)
+        .json({ error: "Justificativa \u00e9 obrigat\u00f3ria" });
+    if (!lojaId)
+      return res.status(400).json({ error: "lojaId \u00e9 obrigat\u00f3rio" });
+
+    let lojaEsperadaId = null;
+    let lojaEsperadaNome = null;
+    let lojaNome = null;
+    const contextoOrdem = await obterContextoOrdemRoteiro(roteiroId);
+    const lojaPuladaInfo = lojaPuladaId
+      ? contextoOrdem.find(
+          (item) => normalizarId(item.id) === normalizarId(lojaPuladaId),
+        )
+      : null;
+
+    if (lojaPuladaInfo?.temPendencia) {
+      lojaEsperadaId = lojaPuladaInfo.id;
+      lojaEsperadaNome = lojaPuladaInfo.nome;
+    } else {
+      const lojaEsperada = contextoOrdem.find((item) => item.temPendencia);
+      if (lojaEsperada) {
+        lojaEsperadaId = lojaEsperada.id;
+        lojaEsperadaNome = lojaEsperada.nome;
+      }
+    }
+
+    // Nome da loja visitada
+    const lojaSelecionada = await Loja.findByPk(lojaId);
+    lojaNome = lojaSelecionada ? lojaSelecionada.nome : null;
+
+    await LogOrdemRoteiro.create({
+      roteiroId,
+      lojaId,
+      usuarioId,
+      lojaEsperadaId,
+      lojaSelecionadaId: lojaId,
+      justificativa: justificativa.trim(),
+      lojaEsperadaNome,
+      lojaNome,
+    });
+
+    const dataHoje = getDataHoje();
+    if (lojaEsperadaId) {
+      const pontoPulado = await RoteiroPontoPulado.findOne({
+        where: {
+          roteiroId,
+          lojaId: lojaEsperadaId,
+          data: dataHoje,
+        },
+      });
+
+      if (!pontoPulado) {
+        await RoteiroPontoPulado.create({
+          roteiroId,
+          lojaId: lojaEsperadaId,
+          data: dataHoje,
+          foiPulado: true,
+          justificativaEnviada: true,
+          justificativa: justificativa.trim(),
+          primeiraQuebraEm: new Date(),
+          ultimaQuebraEm: new Date(),
+          primeiroUsuarioId: usuarioId,
+          ultimoUsuarioId: usuarioId,
+        });
+      } else {
+        await pontoPulado.update({
+          foiPulado: true,
+          justificativaEnviada: true,
+          justificativa: justificativa.trim(),
+          ultimaQuebraEm: new Date(),
+          ultimoUsuarioId: usuarioId,
+          primeiraQuebraEm: pontoPulado.primeiraQuebraEm || new Date(),
+          primeiroUsuarioId: pontoPulado.primeiroUsuarioId || usuarioId,
+        });
+      }
+    }
+
+    // Armazenar para ser aplicada na próxima movimentação desta loja
+    justificativasPendentes.set(lojaId, {
+      justificativa: justificativa.trim(),
+      roteiroId,
+      lojaEsperadaId,
+      lojaEsperadaNome,
+      lojaNome,
+      timestamp: new Date(),
+    });
+
+    res.json({
+      success: true,
+      message: "Justificativa registrada com sucesso",
+      lojaEsperadaId,
+      lojaEsperadaNome,
+      lojaId,
+      lojaNome,
+      justificativa: justificativa.trim(),
+    });
+  } catch (error) {
+    console.error("Erro ao salvar justificativa:", error);
+    res.status(500).json({ error: "Erro ao salvar justificativa" });
+  }
+});
+
+// Verificar se precisa pedir justificativa de quebra de ordem para a loja selecionada
+router.get("/:id/quebra-ordem/status", autenticar, async (req, res) => {
+  try {
+    const { id: roteiroId } = req.params;
+    const { lojaId, lojaAtualId } = req.query;
+
+    if (!lojaId) {
+      return res.status(400).json({ error: "lojaId é obrigatório" });
+    }
+
+    const dataHoje = getDataHoje();
+    const contextoOrdem = await obterContextoOrdemRoteiro(roteiroId);
+    const idsOrdenados = contextoOrdem.map((item) => normalizarId(item.id));
+    const idDestino = normalizarId(lojaId);
+    const idAtual = normalizarId(lojaAtualId);
+
+    if (idAtual) {
+      const indiceAtual = idsOrdenados.indexOf(idAtual);
+      const indiceDestino = idsOrdenados.indexOf(idDestino);
+
+      if (indiceAtual >= 0 && indiceDestino >= 0 && indiceDestino > indiceAtual + 1) {
+        const lojasIntermediarias = contextoOrdem.slice(
+          indiceAtual + 1,
+          indiceDestino,
+        );
+
+        const lojasIntermediariasComPendencia = lojasIntermediarias.filter(
+          (item) => item.temPendencia,
+        );
+
+        const pontosIntermediarios =
+          lojasIntermediariasComPendencia.length > 0
+            ? await RoteiroPontoPulado.findAll({
+                where: {
+                  roteiroId,
+                  data: dataHoje,
+                  lojaId: {
+                    [Op.in]: lojasIntermediariasComPendencia.map((item) => item.id),
+                  },
+                },
+              })
+            : [];
+
+        const pontoIntermediarioPorLojaId = new Map(
+          pontosIntermediarios.map((item) => [normalizarId(item.lojaId), item]),
+        );
+
+        const proximaLojaPuladaSemJustificativa = lojasIntermediariasComPendencia.find(
+          (item) => {
+            const ponto = pontoIntermediarioPorLojaId.get(normalizarId(item.id));
+            return !pontoFoiJustificadoNoDia(ponto);
+          },
+        );
+
+        if (proximaLojaPuladaSemJustificativa) {
+          const pontoPulado = pontoIntermediarioPorLojaId.get(
+            normalizarId(proximaLojaPuladaSemJustificativa.id),
+          );
+
+          return res.json({
+            precisaJustificativa: true,
+            motivo: "loja_pulada_sem_justificativa",
+            lojaEsperadaId: proximaLojaPuladaSemJustificativa.id,
+            lojaEsperadaNome: proximaLojaPuladaSemJustificativa.nome,
+            lojaSelecionadaId: lojaId,
+            lojaSelecionadaNome: null,
+            lojaAtualId: lojaAtualId || null,
+            data: dataHoje,
+            pontoPulado: pontoPulado || null,
+          });
+        }
+
+        return res.json({
+          precisaJustificativa: false,
+          motivo: "ponto_selecionado_ja_justificado",
+          lojaSelecionadaId: lojaId,
+          lojaAtualId: lojaAtualId || null,
+          data: dataHoje,
+        });
+      }
+    }
+
+    const lojaEsperada = await obterLojaEsperadaPendente(roteiroId);
+    if (!lojaEsperada) {
+      return res.json({
+        precisaJustificativa: false,
+        motivo: "sem_pendencia_na_ordem",
+      });
+    }
+
+    if (String(lojaEsperada.id) === String(lojaId)) {
+      return res.json({
+        precisaJustificativa: false,
+        motivo: "na_ordem_correta",
+        lojaEsperadaId: lojaEsperada.id,
+        lojaEsperadaNome: lojaEsperada.nome,
+      });
+    }
+
+    const pontoEsperado = await RoteiroPontoPulado.findOne({
+      where: {
+        roteiroId,
+        lojaId: lojaEsperada.id,
+        data: dataHoje,
+      },
+    });
+
+    const justificativaJaEnviada = pontoFoiJustificadoNoDia(pontoEsperado);
+
+    return res.json({
+      precisaJustificativa: !justificativaJaEnviada,
+      motivo: justificativaJaEnviada
+        ? "ponto_selecionado_ja_justificado"
+        : "loja_pulada_sem_justificativa",
+      lojaEsperadaId: lojaEsperada.id,
+      lojaEsperadaNome: lojaEsperada.nome,
+      lojaSelecionadaId: lojaId,
+      lojaSelecionadaNome: null,
+      data: dataHoje,
+      pontoPulado: pontoEsperado || null,
+    });
+  } catch (error) {
+    console.error("Erro ao verificar status de quebra de ordem:", error);
+    return res
+      .status(500)
+      .json({ error: "Erro ao verificar status de quebra de ordem" });
+  }
+});
+
+// Atualizar campos do roteiro (diasSemana, nome, observacao, funcionarioId, funcionarioNome, veiculoId)
+router.patch(
+  "/:id",
+  autenticar,
+  autorizar(ROLES_GESTAO_ROTEIROS),
+  async (req, res) => {
+    try {
+      const roteiro = await Roteiro.findByPk(req.params.id);
+      if (!roteiro)
+        return res.status(404).json({ error: "Roteiro não encontrado" });
+
+      const camposPermitidos = [
+        "diasSemana",
+        "nome",
+        "observacao",
+        "veiculoId",
+      ];
+      const update = {};
+      camposPermitidos.forEach((c) => {
+        if (req.body[c] !== undefined) update[c] = req.body[c];
+      });
+
+      if (hasFuncionarioPayload(req.body)) {
+        Object.assign(
+          update,
+          await resolverAtualizacaoFuncionarioRoteiro({
+            funcionarioId: req.body.funcionarioId,
+            funcionarioNome: req.body.funcionarioNome,
+          }),
+        );
+      }
+
+      if (update.observacao !== undefined) {
+        if (typeof update.observacao !== "string") {
+          return res
+            .status(400)
+            .json({ error: "observacao deve ser um texto" });
+        }
+        update.observacao = update.observacao.trim() || null;
+      }
+
+      if (update.veiculoId !== undefined) {
+        const veiculoIdNormalizado =
+          update.veiculoId === "" ? null : update.veiculoId;
+        if (veiculoIdNormalizado) {
+          const veiculo = await Veiculo.findByPk(veiculoIdNormalizado);
+          if (!veiculo)
+            return res.status(404).json({ error: "Veículo não encontrado" });
+        }
+        update.veiculoId = veiculoIdNormalizado;
+      }
+
+      if (Object.keys(update).length === 0) {
+        await garantirFuncionarioPersistenteRoteiro(roteiro);
+        return res.json(roteiro);
+      }
+
+      await roteiro.update(update);
+      res.json(roteiro);
+    } catch (error) {
+      if (error.status) {
+        return res.status(error.status).json({ error: error.message });
+      }
+      console.error("Erro ao atualizar roteiro:", error);
+      res.status(500).json({ error: "Erro ao atualizar roteiro" });
+    }
+  },
+);
+
+// Apagar roteiro (ADMIN e GERENCIADOR)
+router.delete(
+  "/:id",
+  autenticar,
+  autorizar(ROLES_GESTAO_ROTEIROS),
+  apagarRoteiro,
+);
+
+// Roteiros do dia corrente: GET /roteiros/do-dia?dia=SEG
+router.get("/do-dia", autenticar, async (req, res) => {
+  try {
+    const DIAS_VALIDOS = ["SEG", "TER", "QUA", "QUI", "SEX", "SAB", "DOM"];
+    const { dia } = req.query;
+    if (!dia || !DIAS_VALIDOS.includes(dia.toUpperCase()))
+      return res.status(400).json({
+        error: `Parâmetro 'dia' obrigatório. Use um de: ${DIAS_VALIDOS.join(", ")}`,
+      });
+    const diaUpper = dia.toUpperCase();
+    const roteiros = await Roteiro.findAll({
+      where: literal(`"Roteiros"."dias_semana"::jsonb @> '"${diaUpper}"'`),
+      include: [
+        { model: Usuario, as: "funcionario", attributes: ["id", "nome", "role"] },
+        {
+          model: Veiculo,
+          as: "veiculo",
+          attributes: ["id", "nome", "modelo", "tipo", "emoji"],
+        },
+        { model: Loja, as: "lojas", attributes: ["id", "nome"] },
+      ],
+    });
+    res.json(roteiros);
+  } catch (error) {
+    console.error("Erro ao filtrar roteiros por dia:", error);
+    res.status(500).json({ error: "Erro ao filtrar roteiros por dia" });
+  }
+});
+
+// Endpoint para buscar todos os roteiros com status
+import { getTodosRoteirosComStatus } from "../controllers/roteiroExecucaoController.js";
+router.get("/com-status", getTodosRoteirosComStatus);
+
+// Página de execução de roteiro: retorna lojas e máquinas do roteiro
+import {
+  getRoteiroExecucaoComStatus,
+  getResumoExecucaoPersistido,
+} from "../controllers/roteiroExecucaoController.js";
+
+router.get("/:id/executar", autenticar, getRoteiroExecucaoComStatus);
+router.get("/:id/resumo-execucao", autenticar, getResumoExecucaoPersistido);
+router.get("/:id/status-semanal", autenticar, obterStatusRoteiroSemanal);
+router.get("/:id/ver-andamento", autenticar, verAndamentoRoteiro);
+
+export default router;

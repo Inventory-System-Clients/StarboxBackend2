@@ -1,0 +1,529 @@
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import morgan from "morgan";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+import { sequelize } from "./database/connection.js";
+import routes from "./routes/index.js";
+import { processarJobAlertaWhatsApp } from "./services/alertManager.js";
+import { inicializarFilaAlertas } from "./services/alertQueueService.js";
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.set("trust proxy", 1);
+
+// Middlewares
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // Permitir recursos inline para a página de relatório
+  }),
+);
+
+// Configurar CORS para aceitar localhost e produção
+if (process.env.NODE_ENV === "production") {
+  app.use((req, res, next) => {
+    const forwardedProto = req.headers["x-forwarded-proto"];
+    const protocoloSeguro =
+      req.secure ||
+      String(Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)
+        .split(",")[0]
+        .trim()
+        .toLowerCase() === "https";
+
+    if (protocoloSeguro) {
+      return next();
+    }
+
+    return res.redirect(307, `https://${req.headers.host}${req.originalUrl}`);
+  });
+}
+
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://localhost:5174",
+  "https://starbox.selfmachine.com.br",
+  "https://starboxdemo.selfmachine.com.br",
+  process.env.FRONTEND_URL,
+  ...(process.env.FRONTEND_URLS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+].filter(Boolean); // Remove undefined se FRONTEND_URL não estiver definida
+
+const permiteVercelPreviews = ["1", "true", "yes", "on"].includes(
+  String(process.env.ALLOW_VERCEL_PREVIEWS || "false")
+    .toLowerCase()
+    .trim(),
+);
+
+const vercelPreviewRegex = /^https:\/\/[a-z0-9-]+\.vercel\.app$/i;
+
+const origemPermitida = (origin) => {
+  if (!origin) {
+    return true;
+  }
+
+  if (allowedOrigins.includes(origin)) {
+    return true;
+  }
+
+  if (permiteVercelPreviews && vercelPreviewRegex.test(origin)) {
+    return true;
+  }
+
+  return false;
+};
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // Permitir requisições sem origin (como mobile apps, Postman, curl)
+      if (origemPermitida(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Security-Token"],
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
+  }),
+);
+
+// Middleware para garantir headers CORS em todas as respostas, inclusive OPTIONS
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origemPermitida(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
+  res.header(
+    "Access-Control-Allow-Methods",
+    "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+  );
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Security-Token",
+  );
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+app.use(morgan("dev"));
+app.use(express.json({ limit: "3mb" }));
+app.use(express.urlencoded({ extended: true, limit: "3mb" }));
+
+// Servir arquivos estáticos da pasta public
+app.use("/public", express.static(path.join(__dirname, "..", "public")));
+
+// Root route
+app.get("/", (req, res) => {
+  res.json({
+    message: "Agarra Mais API",
+    version: "1.0.0",
+    status: "online",
+    endpoints: {
+      health: "/health",
+      auth: "/api/auth",
+      usuarios: "/api/usuarios",
+      lojas: "/api/lojas",
+      maquinas: "/api/maquinas",
+      produtos: "/api/produtos",
+      movimentacoes: "/api/movimentacoes",
+      relatorios: "/api/relatorios",
+    },
+  });
+});
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({ status: "OK", timestamp: new Date().toISOString() });
+});
+
+// Debug endpoint - remover em produção
+app.get("/debug/admin", async (req, res) => {
+  const { Usuario } = await import("./models/index.js");
+  const admin = await Usuario.findOne({
+    where: { email: process.env.ADMIN_EMAIL || "admin@agarramais.com" },
+  });
+  res.json({
+    adminExists: !!admin,
+    email: admin?.email,
+    role: admin?.role,
+    ativo: admin?.ativo,
+  });
+});
+
+// Routes
+app.use("/api", routes);
+
+// Error handling
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(err.status || 500).json({
+    error: {
+      message: err.message || "Erro interno do servidor",
+      status: err.status || 500,
+    },
+  });
+});
+
+// Database connection and server start
+const startServer = async () => {
+  try {
+    await sequelize.authenticate();
+    console.log("✅ Conexão com PostgreSQL estabelecida com sucesso!");
+
+    // Sync database - cria novas tabelas/colunas mas não altera existentes
+    // Para evitar erros de sintaxe SQL ao adicionar constraints
+    await sequelize.sync();
+    console.log("✅ Database sincronizado!");
+
+    // --- Migrations inline: ajustes de colunas existentes ---
+    try {
+      await sequelize.query(`
+        ALTER TYPE "enum_usuarios_role"
+        ADD VALUE IF NOT EXISTS 'FUNCIONARIO_TODAS_LOJAS'
+      `);
+      await sequelize.query(`
+        ALTER TYPE "enum_usuarios_role"
+        ADD VALUE IF NOT EXISTS 'CONTROLADOR_ESTOQUE'
+      `);
+      await sequelize.query(`
+        ALTER TYPE "enum_usuarios_role"
+        ADD VALUE IF NOT EXISTS 'ABASTECEDOR'
+      `);
+      console.log(
+        "✅ Migration: roles FUNCIONARIO_TODAS_LOJAS, CONTROLADOR_ESTOQUE e ABASTECEDOR adicionados ao enum de usuarios",
+      );
+    } catch (migErr) {
+      console.warn("⚠️ Migration inline (enum_usuarios_role):", migErr.message);
+    }
+
+    try {
+      // Alterar quantidade_notas_entrada de INTEGER para DECIMAL(10,2) se necessário
+      const [colInfo] = await sequelize.query(`
+        SELECT data_type FROM information_schema.columns
+        WHERE table_name = 'movimentacoes' AND column_name = 'quantidade_notas_entrada'
+      `);
+      if (colInfo.length > 0 && colInfo[0].data_type === "integer") {
+        await sequelize.query(`
+          ALTER TABLE movimentacoes
+          ALTER COLUMN quantidade_notas_entrada TYPE DECIMAL(10,2)
+          USING quantidade_notas_entrada::DECIMAL(10,2)
+        `);
+        console.log(
+          "✅ Migration: quantidade_notas_entrada alterada para DECIMAL(10,2)",
+        );
+      }
+    } catch (migErr) {
+      console.warn(
+        "⚠️ Migration inline (quantidade_notas_entrada):",
+        migErr.message,
+      );
+    }
+
+    try {
+      const [colInfoManutencao] = await sequelize.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'manutencoes' AND column_name = 'quantidadePecaUsada'
+      `);
+
+      if (colInfoManutencao.length === 0) {
+        await sequelize.query(`
+          ALTER TABLE manutencoes
+          ADD COLUMN "quantidadePecaUsada" INTEGER NULL
+        `);
+        console.log(
+          "✅ Migration: coluna manutencoes.quantidadePecaUsada criada",
+        );
+      }
+    } catch (migErr) {
+      console.warn(
+        "⚠️ Migration inline (manutencoes.quantidadePecaUsada):",
+        migErr.message,
+      );
+    }
+
+    try {
+      await sequelize.query(`
+        ALTER TABLE maquinas
+        ADD COLUMN IF NOT EXISTS usa_fichas BOOLEAN NOT NULL DEFAULT false;
+      `);
+
+      await sequelize.query(`
+        UPDATE maquinas
+        SET usa_fichas = false
+        WHERE usa_fichas IS NULL;
+      `);
+
+      console.log(
+        "âœ… Migration: coluna maquinas.usa_fichas criada com default false",
+      );
+    } catch (migErr) {
+      console.warn(
+        "âš ï¸ Migration inline (maquinas.usa_fichas):",
+        migErr.message,
+      );
+    }
+
+    // Migration: Aumentar tamanho dos campos de contas_financeiro
+    try {
+      await sequelize.query(`
+        ALTER TABLE contas_financeiro 
+        ALTER COLUMN name TYPE VARCHAR(150);
+      `);
+      await sequelize.query(`
+        ALTER TABLE contas_financeiro 
+        ALTER COLUMN category TYPE VARCHAR(100);
+      `);
+      await sequelize.query(`
+        ALTER TABLE contas_financeiro 
+        ALTER COLUMN city TYPE VARCHAR(100);
+      `);
+      await sequelize.query(`
+        ALTER TABLE contas_financeiro 
+        ALTER COLUMN status TYPE VARCHAR(50);
+      `);
+      await sequelize.query(`
+        ALTER TABLE contas_financeiro 
+        ALTER COLUMN bill_type TYPE VARCHAR(50);
+      `);
+      await sequelize.query(`
+        ALTER TABLE contas_financeiro 
+        ALTER COLUMN payment_method TYPE VARCHAR(50);
+      `);
+      console.log(
+        "✅ Migration: Campos de contas_financeiro aumentados (name:150, category:100, city:100)",
+      );
+    } catch (migErr) {
+      console.warn(
+        "⚠️ Migration inline (contas_financeiro campos):",
+        migErr.message,
+      );
+    }
+
+    // Migration: Configuração de intervalo de revisão por veículo
+    try {
+      await sequelize.query(`
+        ALTER TABLE veiculos
+        ADD COLUMN IF NOT EXISTS intervalo_revisao_km INTEGER DEFAULT 10000;
+      `);
+
+      await sequelize.query(`
+        UPDATE veiculos
+        SET intervalo_revisao_km = 10000
+        WHERE intervalo_revisao_km IS NULL OR intervalo_revisao_km <= 0;
+      `);
+
+      await sequelize.query(`
+        UPDATE veiculos
+        SET proxima_revisao_km = ((km / intervalo_revisao_km) + 1) * intervalo_revisao_km
+        WHERE proxima_revisao_km IS NULL;
+      `);
+
+      console.log(
+        "✅ Migration: intervalo_revisao_km adicionado em veiculos com valor padrão 10000",
+      );
+    } catch (migErr) {
+      console.warn(
+        "⚠️ Migration inline (intervalo_revisao_km):",
+        migErr.message,
+      );
+    }
+
+    // Migration: KM inicial semanal persistente na execucao de roteiro
+    try {
+      await sequelize.query(`
+        ALTER TABLE roteiro_execucao_semanal
+        ADD COLUMN IF NOT EXISTS veiculo_id UUID REFERENCES veiculos(id) ON DELETE SET NULL;
+      `);
+      await sequelize.query(`
+        ALTER TABLE roteiro_execucao_semanal
+        ADD COLUMN IF NOT EXISTS km_inicial_veiculo INTEGER;
+      `);
+      await sequelize.query(`
+        ALTER TABLE roteiro_execucao_semanal
+        ADD COLUMN IF NOT EXISTS km_inicial_registrado_em TIMESTAMP WITH TIME ZONE;
+      `);
+      await sequelize.query(`
+        CREATE INDEX IF NOT EXISTS idx_roteiro_execucao_semanal_veiculo_id
+        ON roteiro_execucao_semanal (veiculo_id);
+      `);
+
+      console.log(
+        "âœ… Migration: KM inicial semanal adicionado em roteiro_execucao_semanal",
+      );
+    } catch (migErr) {
+      console.warn(
+        "âš ï¸ Migration inline (roteiro_execucao_semanal km inicial):",
+        migErr.message,
+      );
+    }
+
+    // Criar admin padrão se não existir
+    const { Usuario } = await import("./models/index.js");
+    const adminEmail = process.env.ADMIN_EMAIL || "admin@agarramais.com";
+    const adminExistente = await Usuario.findOne({
+      where: { email: adminEmail },
+    });
+
+    if (!adminExistente) {
+      const adminPassword = process.env.ADMIN_PASSWORD || "Admin@123";
+      await Usuario.create({
+        nome: "Administrador",
+        email: adminEmail,
+        senha: adminPassword,
+        role: "ADMIN",
+        telefone: "(11) 99999-9999",
+        ativo: true,
+      });
+      console.log("✅ Usuário admin criado:", adminEmail);
+    }
+
+    const statusFilaAlertas = await inicializarFilaAlertas({
+      processador: processarJobAlertaWhatsApp,
+    });
+
+    if (statusFilaAlertas.enabled) {
+      console.log(
+        `✅ Fila de alertas inicializada (${statusFilaAlertas.queueName}) com concorrencia ${statusFilaAlertas.concurrency}`,
+      );
+    } else {
+      console.log(`ℹ️ Fila de alertas desativada: ${statusFilaAlertas.reason}`);
+    }
+
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`🚀 Servidor rodando na porta ${PORT}`);
+      console.log(`📍 http://localhost:${PORT}`);
+      console.log(`🏥 Health check: http://localhost:${PORT}/health`);
+
+      // Agendar reset semanal dos roteiros (segunda 00:00 em horário de São Paulo)
+      iniciarResetRoteirosSemanal();
+
+      // Agendar limpeza automática de dados antigos (diariamente às 3h da manhã)
+      if (process.env.NODE_ENV === "production") {
+        iniciarLimpezaAutomatica();
+      }
+    });
+
+    const getDataHoraSaoPaulo = () => {
+      const agora = new Date();
+      const formatter = new Intl.DateTimeFormat("pt-BR", {
+        timeZone: "America/Sao_Paulo",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        weekday: "short",
+        hour12: false,
+      });
+
+      const partes = formatter.formatToParts(agora);
+      const obter = (type) => partes.find((parte) => parte.type === type)?.value;
+      const weekdayRaw = (obter("weekday") || "").toLowerCase();
+
+      const mapaDiaSemana = {
+        dom: 0,
+        seg: 1,
+        ter: 2,
+        qua: 3,
+        qui: 4,
+        sex: 5,
+        sab: 6,
+      };
+
+      return {
+        diaSemana: mapaDiaSemana[weekdayRaw.slice(0, 3)] ?? -1,
+        ano: Number.parseInt(obter("year"), 10),
+        mes: Number.parseInt(obter("month"), 10),
+        dia: Number.parseInt(obter("day"), 10),
+        hora: Number.parseInt(obter("hour"), 10),
+        minuto: Number.parseInt(obter("minute"), 10),
+      };
+    };
+
+    // Função para resetar status dos roteiros semanalmente (domingo) às 21h
+    const iniciarResetRoteirosSemanal = async () => {
+      const { resetarRoteirosDiarios } =
+        await import("./utils/resetRoteiros.js");
+
+      let ultimaDataReset = null;
+
+      const executarReset = async () => {
+        const agoraSp = getDataHoraSaoPaulo();
+
+        const ehDomingo = agoraSp.diaSemana === 0;
+        const janelaVinteUmaHoras = agoraSp.hora === 21 && agoraSp.minuto < 5;
+        const chaveDataHoje = `${agoraSp.ano}-${String(agoraSp.mes).padStart(2, "0")}-${String(agoraSp.dia).padStart(2, "0")}`;
+
+        // Recuperação: se o servidor reiniciar no domingo após 21h, executa uma vez naquele dia.
+        if (ehDomingo && (janelaVinteUmaHoras || (agoraSp.hora >= 21 && ultimaDataReset !== chaveDataHoje))) {
+          if (ultimaDataReset === chaveDataHoje) return;
+
+          console.log(
+            "🔄 Resetando status semanal dos roteiros e lojas para pendente (domingo 21h)...",
+          );
+          try {
+            await resetarRoteirosDiarios();
+            ultimaDataReset = chaveDataHoje;
+          } catch (error) {
+            console.error("❌ Erro no reset semanal dos roteiros:", error);
+          }
+        }
+      };
+
+      // Executa no boot e verifica a cada minuto.
+      await executarReset();
+      setInterval(executarReset, 60 * 1000);
+
+      console.log(
+        "⏰ Reset semanal dos roteiros agendado para domingo 21:00 (America/Sao_Paulo)",
+      );
+    };
+  } catch (error) {
+    console.error("❌ Erro ao conectar com o banco de dados:", error);
+    process.exit(1);
+  }
+};
+
+// Função para executar limpeza automática diariamente
+const iniciarLimpezaAutomatica = async () => {
+  const { limparDadosAntigos } = await import("./utils/dataRetention.js");
+
+  const executarLimpeza = async () => {
+    const agora = new Date();
+    const horas = agora.getHours();
+
+    // Executar apenas às 3h da manhã
+    if (horas === 3) {
+      console.log("🗑️  Executando limpeza automática de dados antigos...");
+      try {
+        await limparDadosAntigos();
+      } catch (error) {
+        console.error("❌ Erro na limpeza automática:", error);
+      }
+    }
+  };
+
+  // Executar a cada 1 hora para verificar se é 3h da manhã
+  setInterval(executarLimpeza, 60 * 60 * 1000); // 1 hora em ms
+  console.log("⏰ Limpeza automática agendada para 3h da manhã (diariamente)");
+};
+
+startServer();
+
+export default app;

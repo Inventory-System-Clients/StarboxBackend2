@@ -1,0 +1,824 @@
+import { Op } from "sequelize";
+import {
+  GastoRoteiro,
+  Manutencao,
+  Movimentacao,
+  MovimentacaoProduto,
+  MovimentacaoEstoqueUsuario,
+  MovimentacaoVeiculo,
+  Roteiro,
+  RoteiroExecucaoSemanal,
+  RoteiroResumoExecucao,
+  Veiculo,
+  Loja,
+  Maquina,
+} from "../models/index.js";
+import { getFaixaSemanaAtualUtc } from "../utils/roteiroExecucaoSemanal.js";
+
+const STATUS_MANUTENCAO_REALIZADA = new Set(["feito", "concluida"]);
+
+const toArrayStrings = (value) => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean);
+};
+
+const normalizarNumero = (value, fallback = 0) => {
+  const numero = Number.parseFloat(value);
+  if (!Number.isFinite(numero)) return fallback;
+  return numero;
+};
+
+const formatarMoeda = (valor) => {
+  const numero = normalizarNumero(valor, 0);
+  return numero.toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+  });
+};
+
+const formatarLista = (lista = []) => {
+  const itens = toArrayStrings(lista);
+  return itens.length > 0 ? itens.join(", ") : "Nenhum";
+};
+
+const formatarInteiro = (valor) => {
+  const numero = Number.parseInt(valor, 10);
+  if (!Number.isInteger(numero)) return "-";
+  return numero.toLocaleString("pt-BR");
+};
+
+const chaveMaquinaResumo = (maquina) => {
+  const codigo = String(
+    maquina?.codigo ?? maquina?.numero ?? maquina?.numeroMaquina ?? "",
+  ).trim();
+  if (codigo) return `codigo:${codigo.toLowerCase()}`;
+
+  const id = String(maquina?.id ?? "").trim();
+  if (id) return `id:${id}`;
+
+  const nome = String(maquina?.nome ?? "").trim();
+  return nome ? `nome:${nome.toLowerCase()}` : "";
+};
+
+const coletarMaquinaResumo = ({ maquina, status, mapa, semChave }) => {
+  const chave = chaveMaquinaResumo(maquina);
+  const item = {
+    nome: maquina.nome,
+    status,
+  };
+
+  if (!chave) {
+    semChave.push(item);
+    return;
+  }
+
+  const existente = mapa.get(chave);
+  if (
+    !existente ||
+    (existente.status !== "finalizado" && status === "finalizado")
+  ) {
+    mapa.set(chave, item);
+  }
+};
+
+const parseKmInicialValido = (valor) => {
+  const numero = Number.parseInt(valor, 10);
+  return Number.isInteger(numero) && numero > 0 ? numero : null;
+};
+
+const getFaixaDiaUtc = (data) => {
+  const inicio = new Date(`${data}T00:00:00.000Z`);
+  const fim = new Date(`${data}T23:59:59.999Z`);
+  return { inicio, fim };
+};
+
+const dataValidaOuNull = (valor) => {
+  if (!valor) return null;
+  const data = valor instanceof Date ? valor : new Date(valor);
+  return Number.isNaN(data.getTime()) ? null : data;
+};
+
+const coletarEscopoLojas = (lojas = []) => {
+  const lojaIds = new Set();
+  const maquinaIds = new Set();
+
+  for (const loja of lojas || []) {
+    const lojaId = String(loja?.id || loja?.lojaId || "").trim();
+    if (lojaId) lojaIds.add(lojaId);
+
+    const maquinas = Array.isArray(loja?.maquinas) ? loja.maquinas : [];
+    for (const maquina of maquinas) {
+      const maquinaId = String(maquina?.id || maquina?.maquinaId || "").trim();
+      if (maquinaId) maquinaIds.add(maquinaId);
+    }
+  }
+
+  return { lojaIds, maquinaIds };
+};
+
+const obterEscopoRoteiro = async (roteiroId) => {
+  const roteiro = await Roteiro.findByPk(roteiroId, {
+    attributes: ["id"],
+    include: [
+      {
+        model: Loja,
+        as: "lojas",
+        attributes: ["id"],
+        include: [
+          {
+            model: Maquina,
+            as: "maquinas",
+            attributes: ["id"],
+          },
+        ],
+      },
+    ],
+  });
+
+  return coletarEscopoLojas(roteiro?.lojas || []);
+};
+
+const obterEscopoManutencoes = async ({ roteiroId, lojas }) => {
+  const escopoInformado = coletarEscopoLojas(lojas);
+  if (escopoInformado.lojaIds.size && escopoInformado.maquinaIds.size) {
+    return escopoInformado;
+  }
+
+  return obterEscopoRoteiro(roteiroId);
+};
+
+const montarFiltroEscopoManutencoes = ({ lojaIds, maquinaIds }) => {
+  const filtro = {};
+  if (lojaIds?.size) filtro.lojaId = { [Op.in]: Array.from(lojaIds) };
+  if (maquinaIds?.size) filtro.maquinaId = { [Op.in]: Array.from(maquinaIds) };
+  return filtro;
+};
+
+const manutencaoPertenceAoEscopo = (manutencao, { lojaIds, maquinaIds }) => {
+  const lojaId = String(manutencao.lojaId || "").trim();
+  const maquinaId = String(manutencao.maquinaId || "").trim();
+
+  if (lojaIds?.size && !lojaIds.has(lojaId)) return false;
+  if (maquinaIds?.size && !maquinaIds.has(maquinaId)) return false;
+
+  return true;
+};
+
+const obterJanelaExecucaoManutencoes = async ({ roteiroId, data }) => {
+  const execucaoSemanal = await RoteiroExecucaoSemanal.findOne({
+    where: { roteiroId },
+    attributes: ["id", "dataInicio", "iniciadoEm", "finalizadoEm"],
+  });
+
+  const dataInicio = execucaoSemanal?.dataInicio || data;
+  const inicio =
+    dataValidaOuNull(execucaoSemanal?.iniciadoEm) ||
+    new Date(`${dataInicio}T00:00:00.000Z`);
+  const fim = dataValidaOuNull(execucaoSemanal?.finalizadoEm);
+
+  return { inicio, fim, execucaoSemanal };
+};
+
+const manutencaoFoiRealizadaNaExecucao = (manutencao, { inicio, fim }) => {
+  if (
+    !STATUS_MANUTENCAO_REALIZADA.has(
+      String(manutencao.status || "").toLowerCase(),
+    )
+  ) {
+    return false;
+  }
+
+  const concluidoEm = dataValidaOuNull(manutencao.concluidoEm);
+  if (!concluidoEm || (inicio && concluidoEm < inicio)) return false;
+  if (fim && concluidoEm > fim) return false;
+
+  return true;
+};
+
+const somarQuantidadeAbastecida = (movimentacoes = []) => {
+  return movimentacoes.reduce((total, movimentacao) => {
+    const detalhes = Array.isArray(movimentacao.detalhesProdutos)
+      ? movimentacao.detalhesProdutos
+      : [];
+
+    const totalDetalhes = detalhes.reduce(
+      (acc, detalhe) =>
+        acc + Math.max(0, Number(detalhe.quantidadeAbastecida || 0)),
+      0,
+    );
+
+    return total + totalDetalhes;
+  }, 0);
+};
+
+export const calcularConsumoProdutosRota = async ({
+  roteiroId,
+  data,
+  lojas = [],
+  usuarioId,
+  fimExecucao,
+}) => {
+  if (!roteiroId || !data || !usuarioId) return 0;
+
+  const [escopo, janelaBase] = await Promise.all([
+    obterEscopoManutencoes({ roteiroId, lojas }),
+    obterJanelaExecucaoManutencoes({ roteiroId, data }),
+  ]);
+
+  const maquinaIds = Array.from(escopo.maquinaIds || []);
+  if (!maquinaIds.length) return 0;
+
+  const fim = dataValidaOuNull(fimExecucao) || janelaBase.fim || new Date();
+  const whereDataColeta = fim
+    ? { [Op.between]: [janelaBase.inicio, fim] }
+    : { [Op.gte]: janelaBase.inicio };
+
+  const movimentacoes = await Movimentacao.findAll({
+    where: {
+      usuarioId,
+      maquinaId: { [Op.in]: maquinaIds },
+      dataColeta: whereDataColeta,
+    },
+    attributes: ["id", "maquinaId", "usuarioId", "dataColeta"],
+    include: [
+      {
+        model: MovimentacaoProduto,
+        as: "detalhesProdutos",
+        attributes: ["id", "quantidadeAbastecida"],
+        required: true,
+        where: {
+          quantidadeAbastecida: { [Op.gt]: 0 },
+        },
+      },
+    ],
+  });
+
+  return somarQuantidadeAbastecida(movimentacoes);
+};
+
+const obterResumoQuilometragem = async (resumo) => {
+  if (!resumo?.roteiroId || !resumo?.data) {
+    return {
+      veiculoNome: null,
+      kmInicialRota: null,
+      kmFinalRota: null,
+      kmPercorridoRota: null,
+      funcionarioId: null,
+      retiradaDataHora: null,
+    };
+  }
+
+  const { inicio, fim } = getFaixaDiaUtc(resumo.data);
+
+  const roteiro = await Roteiro.findByPk(resumo.roteiroId, {
+    attributes: ["id", "veiculoId", "funcionarioId"],
+    include: [
+      {
+        model: Veiculo,
+        as: "veiculo",
+        attributes: ["id", "nome"],
+      },
+    ],
+  });
+
+  if (!roteiro?.veiculoId) {
+    return {
+      veiculoNome: null,
+      kmInicialRota: null,
+      kmFinalRota: null,
+      kmPercorridoRota: null,
+      funcionarioId: roteiro?.funcionarioId || null,
+      retiradaDataHora: null,
+    };
+  }
+
+  const execucaoSemanal = await RoteiroExecucaoSemanal.findOne({
+    where: { roteiroId: resumo.roteiroId },
+    attributes: [
+      "id",
+      "veiculoId",
+      "kmInicialVeiculo",
+      "kmInicialRegistradoEm",
+      "dataInicio",
+    ],
+  });
+  const veiculoIdResumo = execucaoSemanal?.veiculoId || roteiro.veiculoId;
+
+  const veiculoExecucao =
+    String(veiculoIdResumo) !== String(roteiro?.veiculoId || "")
+      ? await Veiculo.findByPk(veiculoIdResumo, { attributes: ["id", "nome"] })
+      : roteiro?.veiculo;
+
+  const [retiradaDiaResumo, devolucao] = await Promise.all([
+    MovimentacaoVeiculo.findOne({
+      where: {
+        roteiroId: resumo.roteiroId,
+        veiculoId: veiculoIdResumo,
+        tipo: "retirada",
+        dataHora: {
+          [Op.between]: [inicio, fim],
+        },
+      },
+      order: [["dataHora", "ASC"]],
+    }),
+    MovimentacaoVeiculo.findOne({
+      where: {
+        roteiroId: resumo.roteiroId,
+        veiculoId: veiculoIdResumo,
+        tipo: "devolucao",
+        dataHora: {
+          [Op.between]: [inicio, fim],
+        },
+      },
+      order: [["dataHora", "DESC"]],
+    }),
+  ]);
+
+  let kmInicialRota = parseKmInicialValido(execucaoSemanal?.kmInicialVeiculo);
+  let retiradaDataHora =
+    kmInicialRota !== null && execucaoSemanal?.kmInicialRegistradoEm
+      ? execucaoSemanal.kmInicialRegistradoEm
+      : null;
+
+  if (kmInicialRota === null) {
+    const dataInicioRota = execucaoSemanal?.dataInicio || resumo.data;
+    const faixaInicioRota = getFaixaDiaUtc(dataInicioRota);
+    const retiradaInicioRota = await MovimentacaoVeiculo.findOne({
+      where: {
+        roteiroId: resumo.roteiroId,
+        veiculoId: veiculoIdResumo,
+        tipo: "retirada",
+        km: {
+          [Op.ne]: null,
+        },
+        dataHora: {
+          [Op.between]: [faixaInicioRota.inicio, faixaInicioRota.fim],
+        },
+      },
+      order: [["dataHora", "ASC"]],
+    });
+
+    kmInicialRota =
+      parseKmInicialValido(retiradaInicioRota?.km) ??
+      parseKmInicialValido(retiradaDiaResumo?.km);
+    retiradaDataHora =
+      retiradaInicioRota?.dataHora || retiradaDiaResumo?.dataHora || null;
+
+    if (execucaoSemanal && kmInicialRota !== null) {
+      await execucaoSemanal.update({
+        veiculoId: veiculoIdResumo,
+        kmInicialVeiculo: kmInicialRota,
+        kmInicialRegistradoEm: retiradaDataHora,
+      });
+    }
+  }
+
+  const kmFinalRota = Number.isInteger(Number.parseInt(devolucao?.km, 10))
+    ? Number.parseInt(devolucao.km, 10)
+    : null;
+
+  let kmPercorridoRota = null;
+  if (kmInicialRota !== null && kmFinalRota !== null && kmFinalRota >= kmInicialRota) {
+    kmPercorridoRota = kmFinalRota - kmInicialRota;
+  }
+
+  return {
+    veiculoNome: veiculoExecucao?.nome || null,
+    kmInicialRota,
+    kmFinalRota,
+    kmPercorridoRota,
+    funcionarioId: roteiro.funcionarioId || null,
+    retiradaDataHora,
+  };
+};
+
+const obterEstoqueAdicional = async ({ funcionarioId, retiradaDataHora, data }) => {
+  if (!funcionarioId || !retiradaDataHora || !data) return 0;
+
+  const fimRota = new Date(`${data}T23:59:59.999Z`);
+
+  const whereClause = {
+    usuarioId: funcionarioId,
+    tipoMovimentacao: "entrada",
+    dataMovimentacao: {
+      [Op.gt]: retiradaDataHora,
+      [Op.lte]: fimRota,
+    },
+  };
+
+  const soma = await MovimentacaoEstoqueUsuario.sum("quantidade", {
+    where: whereClause,
+  });
+
+  return Number.isFinite(soma) ? soma : 0;
+};
+
+const montarResumoManutencoes = async ({ roteiroId, data, lojas }) => {
+  const [escopo, janela] = await Promise.all([
+    obterEscopoManutencoes({ roteiroId, lojas }),
+    obterJanelaExecucaoManutencoes({ roteiroId, data }),
+  ]);
+
+  const manutencoes = await Manutencao.findAll({
+    where: {
+      roteiroId,
+      ...montarFiltroEscopoManutencoes(escopo),
+    },
+    include: [
+      {
+        association: "loja",
+        attributes: ["id", "nome"],
+      },
+    ],
+    order: [["createdAt", "ASC"]],
+  });
+
+  const realizadas = [];
+  const naoRealizadas = [];
+  const lojasComManutencaoRealizada = new Set();
+  const mapaNaoRealizadasPorPonto = new Map();
+
+  for (const manutencao of manutencoes) {
+    if (!manutencaoPertenceAoEscopo(manutencao, escopo)) continue;
+
+    const lojaNome = manutencao.loja?.nome || "Ponto sem nome";
+    const descricao = manutencao.descricao || "Manutenção sem descrição";
+    const itemTexto = `${descricao} (${lojaNome})`;
+
+    if (manutencaoFoiRealizadaNaExecucao(manutencao, janela)) {
+      realizadas.push(itemTexto);
+      lojasComManutencaoRealizada.add(lojaNome);
+      continue;
+    }
+
+    if (
+      STATUS_MANUTENCAO_REALIZADA.has(
+        String(manutencao.status || "").toLowerCase(),
+      )
+    ) {
+      continue;
+    }
+
+    naoRealizadas.push(itemTexto);
+    if (!mapaNaoRealizadasPorPonto.has(lojaNome)) {
+      mapaNaoRealizadasPorPonto.set(lojaNome, []);
+    }
+    mapaNaoRealizadasPorPonto.get(lojaNome).push(descricao);
+  }
+
+  const naoRealizadasPorPonto = Array.from(mapaNaoRealizadasPorPonto.entries()).map(
+    ([ponto, manutencoesPonto]) => ({
+      ponto,
+      manutencoes: manutencoesPonto,
+    }),
+  );
+
+  return {
+    totalManutencoesRealizadas: realizadas.length,
+    lojasComManutencaoRealizada: Array.from(lojasComManutencaoRealizada),
+    manutencoesRealizadas: realizadas,
+    manutencoesNaoRealizadas: naoRealizadas,
+    manutencoesNaoRealizadasPorPonto: naoRealizadasPorPonto,
+  };
+};
+
+const getResumoPlain = (resumo) =>
+  typeof resumo?.toJSON === "function" ? resumo.toJSON() : { ...resumo };
+
+const montarManutencaoRealizadaEstruturada = (manutencao) => {
+  const lojaNome = manutencao.loja?.nome || "Ponto sem nome";
+  const descricao = manutencao.descricao || "Manutencao sem descricao";
+
+  return {
+    id: manutencao.id,
+    descricao,
+    lojaId: manutencao.lojaId || null,
+    lojaNome,
+    maquinaId: manutencao.maquinaId || null,
+    status: manutencao.status,
+    concluidoEm: manutencao.concluidoEm || null,
+    dataConclusao: manutencao.concluidoEm || null,
+    texto: `${descricao} (${lojaNome})`,
+    createdAt: manutencao.createdAt || null,
+    updatedAt: manutencao.updatedAt || null,
+  };
+};
+
+export const serializarResumoExecucao = async (resumo) => {
+  if (!resumo) return null;
+
+  const resumoPlain = getResumoPlain(resumo);
+  const [execucaoSemanal, manutencoesRealizadas] = await Promise.all([
+    obterJanelaExecucaoManutencoes({
+      roteiroId: resumoPlain.roteiroId,
+      data: resumoPlain.data,
+    }),
+    obterEscopoManutencoes({
+      roteiroId: resumoPlain.roteiroId,
+      lojas: [],
+    }),
+  ]).then(async ([janela, escopo]) => {
+    const manutencoes = await Manutencao.findAll({
+      where: {
+        roteiroId: resumoPlain.roteiroId,
+        ...montarFiltroEscopoManutencoes(escopo),
+      },
+      include: [
+        {
+          association: "loja",
+          attributes: ["id", "nome"],
+        },
+      ],
+      order: [["createdAt", "ASC"]],
+    });
+
+    return [
+      janela.execucaoSemanal,
+      manutencoes.filter(
+        (manutencao) =>
+          manutencaoPertenceAoEscopo(manutencao, escopo) &&
+          manutencaoFoiRealizadaNaExecucao(manutencao, janela),
+      ),
+    ];
+  });
+
+  const finalizadoEm =
+    execucaoSemanal?.finalizadoEm || resumoPlain.fechadoEm || null;
+
+  return {
+    ...resumoPlain,
+    dataInicio: execucaoSemanal?.dataInicio || null,
+    iniciadoEm: execucaoSemanal?.iniciadoEm || null,
+    finalizadoEm,
+    manutencoesRealizadas: manutencoesRealizadas.map(
+      montarManutencaoRealizadaEstruturada,
+    ),
+  };
+};
+
+const montarPayloadResumo = async ({
+  roteiroId,
+  data,
+  roteiroNome,
+  lojas = [],
+  estoqueInicialTotal,
+  estoqueFinalTotal,
+  consumoTotalProdutos,
+}) => {
+  const pontosFeitos = lojas
+    .filter((loja) => loja.status === "finalizado")
+    .map((loja) => loja.nome);
+  const pontosNaoFeitos = lojas
+    .filter((loja) => loja.status !== "finalizado")
+    .map((loja) => loja.nome);
+
+  const maquinasResumoPorChave = new Map();
+  const maquinasResumoSemChave = [];
+
+  for (const loja of lojas) {
+    const maquinas = Array.isArray(loja.maquinas) ? loja.maquinas : [];
+    for (const maquina of maquinas) {
+      coletarMaquinaResumo({
+        maquina,
+        status: maquina.status,
+        mapa: maquinasResumoPorChave,
+        semChave: maquinasResumoSemChave,
+      });
+    }
+  }
+
+  const maquinasResumo = [
+    ...maquinasResumoPorChave.values(),
+    ...maquinasResumoSemChave,
+  ];
+  const maquinasFeitas = maquinasResumo
+    .filter((maquina) => maquina.status === "finalizado")
+    .map((maquina) => maquina.nome);
+  const maquinasNaoFeitas = maquinasResumo
+    .filter((maquina) => maquina.status !== "finalizado")
+    .map((maquina) => maquina.nome);
+
+  const faixaSemana = getFaixaSemanaAtualUtc();
+  const roteiro = await Roteiro.findByPk(roteiroId, {
+    attributes: ["id", "orcamentoDiario"],
+  });
+
+  const totalDespesaSemana = await GastoRoteiro.sum("valor", {
+    where: {
+      roteiroId,
+      dataHora: {
+        [Op.between]: [faixaSemana.inicio, faixaSemana.fim],
+      },
+    },
+  });
+
+  const despesaTotal = Number.parseFloat(normalizarNumero(totalDespesaSemana, 0).toFixed(2));
+  const orcamento = normalizarNumero(roteiro?.orcamentoDiario, 2000);
+  const sobraValorDespesa = Number.parseFloat((orcamento - despesaTotal).toFixed(2));
+
+  const resumoManutencoes = await montarResumoManutencoes({
+    roteiroId,
+    data,
+    lojas,
+  });
+
+  return {
+    roteiroId,
+    data,
+    roteiroNome,
+    pontosFeitos,
+    pontosNaoFeitos,
+    maquinasFeitas,
+    maquinasNaoFeitas,
+    estoqueInicialTotal,
+    estoqueFinalTotal,
+    consumoTotalProdutos,
+    despesaTotal,
+    sobraValorDespesa,
+    ...resumoManutencoes,
+  };
+};
+
+export const salvarSnapshotResumoExecucao = async ({
+  roteiroId,
+  data,
+  roteiroNome,
+  lojas,
+  estoqueInicialTotal,
+  estoqueFinalTotal,
+  consumoTotalProdutos,
+}) => {
+  const existente = await RoteiroResumoExecucao.findOne({
+    where: { roteiroId, data },
+  });
+
+  if (existente?.status === "finalizado") {
+    return existente;
+  }
+
+  const payload = await montarPayloadResumo({
+    roteiroId,
+    data,
+    roteiroNome,
+    lojas,
+    estoqueInicialTotal,
+    estoqueFinalTotal,
+    consumoTotalProdutos,
+  });
+
+  if (!existente) {
+    return RoteiroResumoExecucao.create({
+      ...payload,
+      status: "em_andamento",
+    });
+  }
+
+  await existente.update({
+    ...payload,
+    status: "em_andamento",
+  });
+
+  return existente;
+};
+
+export const fecharResumoExecucao = async ({
+  roteiroId,
+  data,
+  fechadoPorId,
+  roteiroNome,
+  lojas,
+  estoqueInicialTotal,
+  estoqueFinalTotal,
+  consumoTotalProdutos,
+}) => {
+  const existente = await RoteiroResumoExecucao.findOne({
+    where: { roteiroId, data },
+  });
+
+  if (existente?.status === "finalizado") {
+    return existente;
+  }
+
+  const payload = await montarPayloadResumo({
+    roteiroId,
+    data,
+    roteiroNome,
+    lojas,
+    estoqueInicialTotal,
+    estoqueFinalTotal,
+    consumoTotalProdutos,
+  });
+
+  if (!existente) {
+    return RoteiroResumoExecucao.create({
+      ...payload,
+      status: "finalizado",
+      fechadoPorId: fechadoPorId || null,
+      fechadoEm: new Date(),
+    });
+  }
+
+  await existente.update({
+    ...payload,
+    status: "finalizado",
+    fechadoPorId: fechadoPorId || null,
+    fechadoEm: new Date(),
+  });
+
+  return existente;
+};
+
+export const obterResumoExecucao = async ({ roteiroId, data }) => {
+  return RoteiroResumoExecucao.findOne({
+    where: {
+      roteiroId,
+      data,
+    },
+  });
+};
+
+export const montarMensagemResumoWhatsapp = async (resumo) => {
+  if (!resumo) return "Resumo da rota não encontrado.";
+
+  const resumoQuilometragem = await obterResumoQuilometragem(resumo);
+
+  const estoqueAdicional = await obterEstoqueAdicional({
+    funcionarioId: resumoQuilometragem.funcionarioId,
+    retiradaDataHora: resumoQuilometragem.retiradaDataHora,
+    data: resumo.data,
+  });
+
+  const manutencoesNaoRealizadasPorPonto = Array.isArray(
+    resumo.manutencoesNaoRealizadasPorPonto,
+  )
+    ? resumo.manutencoesNaoRealizadasPorPonto
+        .map((item) => {
+          const ponto = String(item?.ponto || "Ponto sem nome").trim();
+          const lista = formatarLista(item?.manutencoes || []);
+          return `${ponto}: ${lista}`;
+        })
+        .filter(Boolean)
+    : [];
+
+  const totalManutencoesRealizadas = Number(resumo.totalManutencoesRealizadas || 0);
+  const manutencoesRealizadas = Array.isArray(resumo.manutencoesRealizadas)
+    ? resumo.manutencoesRealizadas
+    : [];
+  const manutencoesNaoRealizadas = Array.isArray(resumo.manutencoesNaoRealizadas)
+    ? resumo.manutencoesNaoRealizadas
+    : [];
+
+  const totalPontosFeitos = Array.isArray(resumo.pontosFeitos)
+    ? resumo.pontosFeitos.length
+    : 0;
+  const totalPontosNaoFeitos = Array.isArray(resumo.pontosNaoFeitos)
+    ? resumo.pontosNaoFeitos.length
+    : 0;
+  const totalPontosNaRota = totalPontosFeitos + totalPontosNaoFeitos;
+  const totalMaquinasFeitas = Array.isArray(resumo.maquinasFeitas)
+    ? resumo.maquinasFeitas.length
+    : 0;
+  const totalMaquinasNaoFeitas = Array.isArray(resumo.maquinasNaoFeitas)
+    ? resumo.maquinasNaoFeitas.length
+    : 0;
+
+  const blocoVeiculo = resumoQuilometragem.veiculoNome
+    ? [
+        `Veiculo da rota: ${resumoQuilometragem.veiculoNome}`,
+        `KM inicial: ${formatarInteiro(resumoQuilometragem.kmInicialRota)}`,
+        `KM final: ${formatarInteiro(resumoQuilometragem.kmFinalRota)}`,
+        `KM percorrido: ${formatarInteiro(resumoQuilometragem.kmPercorridoRota)}`,
+      ]
+    : [];
+
+  const estoqueInicial = resumo.estoqueInicialTotal ?? 0;
+
+  const blocoEstoqueAdicional = estoqueAdicional > 0
+    ? [
+        `Estoque adicional: ${estoqueAdicional} produtos`,
+      ]
+    : [];
+
+  return [
+    `Roteiro: ${resumo.roteiroNome || "Sem nome"}`,
+    ...blocoVeiculo,
+    `Total de pontos na rota: ${totalPontosNaRota}`,
+    `Pontos feitos: ${totalPontosFeitos}`,
+    `Pontos nao feitos: ${totalPontosNaoFeitos}`,
+    `Maquinas feitas: ${totalMaquinasFeitas}`,
+    `Maquinas nao feitas: ${totalMaquinasNaoFeitas}`,
+    `Estoque inicial: ${resumo.estoqueInicialTotal ?? "-"} produtos`,
+    ...blocoEstoqueAdicional,
+    `Estoque final: ${resumo.estoqueFinalTotal ?? "-"} produtos`,
+    `Total gasto na rota: ${resumo.consumoTotalProdutos ?? "-"} produtos`,
+    `Despesa total: ${formatarMoeda(resumo.despesaTotal)}`,
+    `Sobra valor despesa: ${formatarMoeda(resumo.sobraValorDespesa)}`,
+    `Total de manutencoes realizadas: ${totalManutencoesRealizadas}`,
+    `Lojas com manutencao realizada: ${formatarLista(resumo.lojasComManutencaoRealizada)}`,
+    `Manutencoes realizadas (${manutencoesRealizadas.length}): ${formatarLista(manutencoesRealizadas)}`,
+    `Manutencoes nao realizadas (${manutencoesNaoRealizadas.length}): ${formatarLista(manutencoesNaoRealizadas)}`,
+    `Manutencoes nao realizadas por ponto: ${formatarLista(manutencoesNaoRealizadasPorPonto)}`,
+  ].join("\n");
+};

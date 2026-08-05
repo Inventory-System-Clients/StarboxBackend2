@@ -1,0 +1,733 @@
+import {
+  Maquina,
+  Loja,
+  Movimentacao,
+  MovimentacaoProduto,
+  GastoFixoLoja,
+} from "../models/index.js";
+import { Op } from "sequelize";
+import { parseListParams, buildPaginatedResponse } from "../utils/pagination.js";
+
+const possuiNumero = (valor) =>
+  valor !== null &&
+  valor !== undefined &&
+  valor !== "" &&
+  !Number.isNaN(Number(valor));
+
+const inteiroSeguro = (valor, fallback = 0) => {
+  if (!possuiNumero(valor)) return fallback;
+  return parseInt(valor, 10);
+};
+
+const booleanoOuDefault = (valor, fallback = false) => {
+  if (valor === undefined || valor === null || valor === "") return fallback;
+  if (typeof valor === "boolean") return valor;
+  if (typeof valor === "number") return valor === 1;
+
+  const texto = String(valor).trim().toLowerCase();
+  if (["true", "1", "sim", "s", "yes"].includes(texto)) return true;
+  if (["false", "0", "nao", "não", "n", "no"].includes(texto)) return false;
+  return fallback;
+};
+
+const normalizarNomeGasto = (nome) =>
+  String(nome || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]/g, "");
+
+const obterValorAluguelDaLoja = async (lojaId) => {
+  if (!lojaId) {
+    return 0;
+  }
+
+  const gastosDaLoja = await GastoFixoLoja.findAll({
+    where: { lojaId },
+    attributes: ["nome", "valor"],
+    raw: true,
+  });
+
+  const aluguel = gastosDaLoja.find(
+    (item) => normalizarNomeGasto(item.nome) === "aluguel",
+  );
+
+  return aluguel ? Number(aluguel.valor || 0) : 0;
+};
+
+const validarComissaoPorAluguel = async ({
+  lojaId,
+  comissaoLojaPercentual,
+}) => {
+  const loja = await Loja.findByPk(lojaId, {
+    attributes: ["id"],
+  });
+
+  if (!loja) {
+    return { status: 404, error: "Loja não encontrada" };
+  }
+
+  const valorAluguel = await obterValorAluguelDaLoja(lojaId);
+  const comissaoInformada = possuiNumero(comissaoLojaPercentual)
+    ? Number(comissaoLojaPercentual)
+    : null;
+
+  if (valorAluguel > 0) {
+    if ((comissaoInformada ?? 0) !== 0) {
+      return {
+        status: 400,
+        error:
+          "Este ponto possui aluguel maior que zero. A comissão da máquina deve ser 0%.",
+      };
+    }
+
+    return null;
+  }
+
+  if (comissaoInformada === null) {
+    return {
+      status: 400,
+      error: "Este ponto não possui aluguel. Informe a comissão da máquina.",
+    };
+  }
+
+  return null;
+};
+
+const calcularContadoresProjetados = (historico) => {
+  let contadorInProjetado = 0;
+  let contadorOutProjetado = 0;
+
+  for (const mov of historico) {
+    const fichas = inteiroSeguro(mov.fichas, 0);
+    const sairam = inteiroSeguro(mov.sairam, 0);
+
+    if (possuiNumero(mov.contadorIn)) {
+      contadorInProjetado = inteiroSeguro(mov.contadorIn, contadorInProjetado);
+    } else {
+      contadorInProjetado += fichas;
+    }
+
+    if (possuiNumero(mov.contadorOut)) {
+      contadorOutProjetado = inteiroSeguro(
+        mov.contadorOut,
+        contadorOutProjetado,
+      );
+    } else {
+      contadorOutProjetado += sairam;
+    }
+  }
+
+  return {
+    contadorInProjetado: Math.max(0, contadorInProjetado),
+    contadorOutProjetado: Math.max(0, contadorOutProjetado),
+  };
+};
+// Calcula quantidade atual e sugestão de abastecimento
+export const obterUltimoProduto = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Busca a última movimentação com os produtos incluídos via associação
+    const ultimaMovimentacao = await Movimentacao.findOne({
+      where: { maquinaId: id },
+      order: [
+        ["dataColeta", "DESC"],
+        ["createdAt", "DESC"],
+      ],
+      include: [
+        {
+          model: MovimentacaoProduto,
+          as: "detalhesProdutos",
+          attributes: ["produtoId"],
+          required: false,
+        },
+      ],
+    });
+
+    console.log("[obterUltimoProduto] maquinaId:", id);
+    console.log(
+      "[obterUltimoProduto] ultimaMovimentacao id:",
+      ultimaMovimentacao?.id,
+    );
+    console.log(
+      "[obterUltimoProduto] detalhesProdutos:",
+      JSON.stringify(ultimaMovimentacao?.detalhesProdutos),
+    );
+
+    if (!ultimaMovimentacao) {
+      return res.json({ produtoId: null });
+    }
+
+    const produtoId =
+      ultimaMovimentacao.detalhesProdutos?.[0]?.produtoId || null;
+    return res.json({ produtoId });
+  } catch (error) {
+    console.error("Erro ao obter último produto da máquina:", error);
+    return res.status(500).json({ error: "Erro ao obter último produto" });
+  }
+};
+
+export const calcularQuantidadeAtual = async (req, res) => {
+  try {
+    const {
+      maquinaId,
+      contadorIn,
+      contadorOut,
+      contadorInAnterior,
+      contadorOutAnterior,
+    } = req.query;
+    if (!maquinaId) {
+      return res.status(400).json({
+        error: "maquinaId é obrigatório",
+      });
+    }
+
+    const maquina = await Maquina.findByPk(maquinaId);
+    if (!maquina) {
+      return res.status(404).json({ error: "Máquina não encontrada" });
+    }
+
+    const historico = await Movimentacao.findAll({
+      where: { maquinaId },
+      attributes: [
+        "contadorIn",
+        "contadorOut",
+        "fichas",
+        "sairam",
+        "totalPos",
+        "dataColeta",
+        "createdAt",
+      ],
+      order: [
+        ["dataColeta", "ASC"],
+        ["createdAt", "ASC"],
+      ],
+    });
+
+    const { contadorInProjetado, contadorOutProjetado } =
+      calcularContadoresProjetados(historico);
+
+    const capacidade = parseInt(maquina.capacidadePadrao) || 0;
+    const totalMovimentacoes = historico.length;
+    const primeiraMovimentacao = totalMovimentacoes === 0;
+    const ultimaMovimentacao = historico[historico.length - 1] || null;
+
+    const contadorInAtual = possuiNumero(contadorIn)
+      ? inteiroSeguro(contadorIn, contadorInProjetado)
+      : contadorInProjetado;
+    const contadorOutAtual = possuiNumero(contadorOut)
+      ? inteiroSeguro(contadorOut, contadorOutProjetado)
+      : contadorOutProjetado;
+    const contadorInAnteriorPrimeira = possuiNumero(contadorInAnterior)
+      ? inteiroSeguro(contadorInAnterior, contadorInProjetado)
+      : contadorInProjetado;
+    const contadorOutAnteriorPrimeira = possuiNumero(contadorOutAnterior)
+      ? inteiroSeguro(contadorOutAnterior, contadorOutProjetado)
+      : contadorOutProjetado;
+
+    const totalPosUltimaMovimentacao = possuiNumero(
+      ultimaMovimentacao?.totalPos,
+    )
+      ? inteiroSeguro(ultimaMovimentacao.totalPos, capacidade)
+      : capacidade;
+
+    const contadorOutUltimaMovimentacao = primeiraMovimentacao
+      ? contadorOutAnteriorPrimeira
+      : possuiNumero(ultimaMovimentacao?.contadorOut)
+        ? inteiroSeguro(ultimaMovimentacao.contadorOut, contadorOutProjetado)
+        : contadorOutProjetado;
+
+    const contadorInBase = primeiraMovimentacao
+      ? contadorInAnteriorPrimeira
+      : contadorInProjetado;
+
+    const quantidadeDeveriaTerSaido = Math.max(
+      0,
+      contadorOutAtual - contadorOutUltimaMovimentacao,
+    );
+
+    const quantidadeAtualPorContadores = Math.max(
+      0,
+      totalPosUltimaMovimentacao - quantidadeDeveriaTerSaido,
+    );
+    const totalPreEsperado = quantidadeAtualPorContadores;
+    const quantidadeAtual = totalPreEsperado;
+    const sugestaoAbastecimento =
+      capacidade > 0 ? Math.max(0, capacidade - quantidadeAtual) : 0;
+    const saidaCalculada = quantidadeDeveriaTerSaido;
+
+    res.json({
+      quantidadeAtual: quantidadeAtual >= 0 ? quantidadeAtual : 0,
+      totalPreEsperado,
+      sugestaoAbastecimento,
+      capacidadePadrao: capacidade,
+      contadorInSugerido: contadorInBase,
+      contadorOutSugerido: contadorOutProjetado,
+      contadorInAtual,
+      contadorOutAtual,
+      totalPosUltimaMovimentacao,
+      contadorOutUltimaMovimentacao,
+      quantidadeDeveriaTerSaido,
+      saidaCalculada,
+      totalMovimentacoes,
+      primeiraMovimentacao,
+    });
+  } catch (error) {
+    console.error("Erro ao calcular quantidade atual:", error);
+    res.status(500).json({ error: "Erro ao calcular quantidade atual" });
+  }
+};
+
+// US05 - Listar máquinas
+export const listarMaquinas = async (req, res) => {
+  try {
+    const { lojaId, incluirInativas, busca } = req.query;
+    const params = parseListParams(req.query, { defaultPageSize: 20 });
+    const where = {};
+
+    if (lojaId) {
+      where.lojaId = lojaId;
+    }
+
+    // Por padrão, só mostra máquinas ativas
+    // Para ver inativas, passar ?incluirInativas=true
+    if (incluirInativas !== "true") {
+      where.ativo = true;
+    }
+
+    if (busca) {
+      where[Op.or] = [
+        { nome: { [Op.iLike]: `%${busca}%` } },
+        { codigo: { [Op.iLike]: `%${busca}%` } },
+      ];
+    }
+
+    const include = [
+      {
+        model: Loja,
+        as: "loja",
+        attributes: ["id", "nome", "cidade"],
+      },
+    ];
+    const order = [["codigo", "ASC"]];
+
+    if (params.all) {
+      const maquinas = await Maquina.findAll({
+        where,
+        attributes: { exclude: [] },
+        include,
+        order,
+      });
+      return res.json(maquinas);
+    }
+
+    const { rows, count } = await Maquina.findAndCountAll({
+      where,
+      attributes: { exclude: [] },
+      include,
+      order,
+      limit: params.limit,
+      offset: params.offset,
+      distinct: true,
+    });
+
+    res.json(buildPaginatedResponse(rows, count, params));
+  } catch (error) {
+    console.error("Erro ao listar máquinas:", error);
+    res.status(500).json({ error: "Erro ao listar máquinas" });
+  }
+};
+export const listarTiposMaquina = async (req, res) => {
+  try {
+    const maquinas = await Maquina.findAll({
+      attributes: ["tipo"],
+      where: {
+        tipo: {
+          [Op.not]: null,
+        },
+      },
+      raw: true,
+    });
+
+    const tiposSet = new Set();
+
+    for (const item of maquinas) {
+      const nome = String(item?.tipo || "").trim();
+      if (nome) tiposSet.add(nome);
+    }
+
+    const tipos = Array.from(tiposSet).sort((a, b) =>
+      a.localeCompare(b, "pt-BR", { sensitivity: "base" }),
+    );
+
+    return res.json({ tipos });
+  } catch (error) {
+    console.error("Erro ao listar tipos de máquina:", error);
+    return res.status(500).json({ error: "Erro ao listar tipos de máquina" });
+  }
+};
+// US05 - Obter máquina por ID
+export const obterMaquina = async (req, res) => {
+  try {
+    const maquina = await Maquina.findByPk(req.params.id, {
+      attributes: { exclude: [] }, // Inclui todos os atributos, inclusive lojaId
+      include: [
+        {
+          model: Loja,
+          as: "loja",
+        },
+      ],
+    });
+
+    if (!maquina) {
+      return res.status(404).json({ error: "Máquina não encontrada" });
+    }
+
+    res.json(maquina);
+  } catch (error) {
+    console.error("Erro ao obter máquina:", error);
+    res.status(500).json({ error: "Erro ao obter máquina" });
+  }
+};
+
+// US05 - Criar máquina
+export const criarMaquina = async (req, res) => {
+  let transaction = null;
+  try {
+    const {
+      codigo,
+      nome,
+      tipo,
+      lojaId,
+      capacidadePadrao,
+      valorFicha,
+      usaFichas,
+      usa_fichas: usaFichasSnake,
+      comissaoLojaPercentual,
+      fichasNecessarias,
+      forcaForte,
+      forcaFraca,
+      forcaPremium,
+      jogadasPremium,
+      percentualAlertaEstoque,
+      localizacao,
+      contadorInInicial,
+      contadorOutInicial,
+    } = req.body;
+
+    if (!codigo || !lojaId) {
+      return res
+        .status(400)
+        .json({ error: "Código e ID da loja são obrigatórios" });
+    }
+
+    if (
+      comissaoLojaPercentual !== undefined &&
+      comissaoLojaPercentual !== null &&
+      (Number(comissaoLojaPercentual) < 0 ||
+        Number(comissaoLojaPercentual) > 100)
+    ) {
+      return res.status(400).json({
+        error: "Comissão da loja deve estar entre 0 e 100",
+      });
+    }
+
+    const erroRegraComissao = await validarComissaoPorAluguel({
+      lojaId,
+      comissaoLojaPercentual,
+    });
+
+    if (erroRegraComissao) {
+      return res.status(erroRegraComissao.status).json({
+        error: erroRegraComissao.error,
+      });
+    }
+
+    // Verificar se código já existe
+    const maquinaExistente = await Maquina.findOne({ where: { codigo } });
+    if (maquinaExistente) {
+      return res.status(400).json({ error: "Código de máquina já existe" });
+    }
+
+    // Se nome não foi informado, usar o código como nome
+    const nomeDefinitivo = nome && nome.trim() ? nome.trim() : codigo;
+
+    transaction = await Maquina.sequelize.transaction();
+
+    const maquina = await Maquina.create(
+      {
+        codigo,
+        nome: nomeDefinitivo,
+        tipo,
+        lojaId,
+        capacidadePadrao: capacidadePadrao || 100,
+        valorFicha: valorFicha || 5.0,
+        usaFichas: booleanoOuDefault(usaFichas ?? usaFichasSnake, false),
+        comissaoLojaPercentual:
+          comissaoLojaPercentual !== undefined &&
+          comissaoLojaPercentual !== null
+            ? Number(comissaoLojaPercentual)
+            : 0,
+        fichasNecessarias: fichasNecessarias || null,
+        forcaForte: forcaForte || null,
+        forcaFraca: forcaFraca || null,
+        forcaPremium: forcaPremium || null,
+        jogadasPremium: jogadasPremium || null,
+        percentualAlertaEstoque: percentualAlertaEstoque || 30,
+        localizacao,
+      },
+      { transaction },
+    );
+
+    const inInicialValido = possuiNumero(contadorInInicial);
+    const outInicialValido = possuiNumero(contadorOutInicial);
+
+    if (inInicialValido || outInicialValido) {
+      if (!inInicialValido || !outInicialValido) {
+        await transaction.rollback();
+        return res.status(422).json({
+          error:
+            "Para criar movimentação inicial no cadastro da máquina, informe contadorInInicial e contadorOutInicial.",
+          code: "MAQUINA_VALIDATION_INITIAL_COUNTERS_REQUIRED",
+        });
+      }
+
+      await Movimentacao.create(
+        {
+          maquinaId: maquina.id,
+          usuarioId: req.usuario.id,
+          dataColeta: new Date(),
+          totalPre: Number(maquina.capacidadePadrao || 100),
+          sairam: 0,
+          abastecidas: 0,
+          fichas: 0,
+          valorFaturado: 0,
+          contadorIn: inteiroSeguro(contadorInInicial, 0),
+          contadorInDigital: inteiroSeguro(contadorInInicial, 0),
+          contadorInAnterior: inteiroSeguro(contadorInInicial, 0),
+          contadorOut: inteiroSeguro(contadorOutInicial, 0),
+          contadorOutDigital: inteiroSeguro(contadorOutInicial, 0),
+          contadorOutAnterior: inteiroSeguro(contadorOutInicial, 0),
+          observacoes: "Movimentação inicial automática no cadastro da máquina",
+          tipoOcorrencia: "Inicial",
+        },
+        { transaction },
+      );
+    }
+
+    await transaction.commit();
+    transaction = null;
+
+    res.locals.entityId = maquina.id;
+    res.status(201).json({
+      ...maquina.toJSON(),
+      movimentacaoInicialCriada: inInicialValido && outInicialValido,
+    });
+  } catch (error) {
+    if (transaction) {
+      await transaction.rollback();
+    }
+    console.error("Erro ao criar máquina:", error);
+    res.status(500).json({ error: "Erro ao criar máquina" });
+  }
+};
+
+// US05 - Atualizar máquina
+export const atualizarMaquina = async (req, res) => {
+  try {
+    const maquina = await Maquina.findByPk(req.params.id);
+
+    if (!maquina) {
+      return res.status(404).json({ error: "Máquina não encontrada" });
+    }
+
+    const {
+      codigo,
+      nome,
+      tipo,
+      lojaId,
+      capacidadePadrao,
+      valorFicha,
+      usaFichas,
+      usa_fichas: usaFichasSnake,
+      comissaoLojaPercentual,
+      fichasNecessarias,
+      forcaForte,
+      forcaFraca,
+      forcaPremium,
+      jogadasPremium,
+      percentualAlertaEstoque,
+      localizacao,
+      ativo,
+    } = req.body;
+
+    // Verificar se novo código já existe em outra máquina
+    if (codigo && codigo !== maquina.codigo) {
+      const maquinaExistente = await Maquina.findOne({ where: { codigo } });
+      if (maquinaExistente) {
+        return res.status(400).json({ error: "Código de máquina já existe" });
+      }
+    }
+
+    if (
+      comissaoLojaPercentual !== undefined &&
+      comissaoLojaPercentual !== null &&
+      (Number(comissaoLojaPercentual) < 0 ||
+        Number(comissaoLojaPercentual) > 100)
+    ) {
+      return res.status(400).json({
+        error: "Comissão da loja deve estar entre 0 e 100",
+      });
+    }
+
+    const lojaIdValidacao = lojaId ?? maquina.lojaId;
+    const comissaoValidacao =
+      comissaoLojaPercentual !== undefined
+        ? comissaoLojaPercentual
+        : maquina.comissaoLojaPercentual;
+
+    const erroRegraComissao = await validarComissaoPorAluguel({
+      lojaId: lojaIdValidacao,
+      comissaoLojaPercentual: comissaoValidacao,
+    });
+
+    if (erroRegraComissao) {
+      return res.status(erroRegraComissao.status).json({
+        error: erroRegraComissao.error,
+      });
+    }
+
+    // Se nome vier vazio, usar o código (atual ou novo) como nome
+    const codigoAtualizado = codigo ?? maquina.codigo;
+    const nomeAtualizado =
+      nome !== undefined
+        ? nome && nome.trim()
+          ? nome.trim()
+          : codigoAtualizado
+        : maquina.nome;
+
+    await maquina.update({
+      codigo: codigoAtualizado,
+      nome: nomeAtualizado,
+      tipo: tipo ?? maquina.tipo,
+      lojaId: lojaId ?? maquina.lojaId,
+      capacidadePadrao: capacidadePadrao ?? maquina.capacidadePadrao,
+      valorFicha: valorFicha ?? maquina.valorFicha,
+      usaFichas: booleanoOuDefault(
+        usaFichas ?? usaFichasSnake,
+        maquina.usaFichas,
+      ),
+      comissaoLojaPercentual:
+        comissaoLojaPercentual ?? maquina.comissaoLojaPercentual,
+      fichasNecessarias: fichasNecessarias ?? maquina.fichasNecessarias,
+      forcaForte: forcaForte ?? maquina.forcaForte,
+      forcaFraca: forcaFraca ?? maquina.forcaFraca,
+      forcaPremium: forcaPremium ?? maquina.forcaPremium,
+      jogadasPremium: jogadasPremium ?? maquina.jogadasPremium,
+      percentualAlertaEstoque:
+        percentualAlertaEstoque ?? maquina.percentualAlertaEstoque,
+      localizacao: localizacao ?? maquina.localizacao,
+      ativo: ativo ?? maquina.ativo,
+    });
+
+    res.json(maquina);
+  } catch (error) {
+    console.error("Erro ao atualizar máquina:", error);
+    res.status(500).json({ error: "Erro ao atualizar máquina" });
+  }
+};
+
+// US05 - Deletar máquina (soft delete na 1ª vez, hard delete na 2ª)
+export const deletarMaquina = async (req, res) => {
+  try {
+    const maquina = await Maquina.findByPk(req.params.id);
+
+    if (!maquina) {
+      return res.status(404).json({ error: "Máquina não encontrada" });
+    }
+
+    // Se já está inativa, deletar permanentemente
+    if (!maquina.ativo) {
+      await maquina.destroy();
+      res.locals.entityId = req.params.id;
+      return res.json({
+        message: "Máquina excluída permanentemente com sucesso",
+        permanentDelete: true,
+      });
+    }
+
+    // Se está ativa, apenas desativar (soft delete)
+    await maquina.update({ ativo: false });
+    res.locals.entityId = maquina.id;
+    res.json({
+      message:
+        "Máquina desativada com sucesso. Clique novamente para excluir permanentemente.",
+      permanentDelete: false,
+    });
+  } catch (error) {
+    console.error("Erro ao deletar máquina:", error);
+    res.status(500).json({ error: "Erro ao deletar máquina" });
+  }
+};
+
+// US07 - Obter estoque atual da máquina
+export const obterEstoqueAtual = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    console.log("🔍 [obterEstoqueAtual] Buscando estoque para máquina:", id);
+
+    const maquina = await Maquina.findByPk(id);
+
+    if (!maquina) {
+      console.log("❌ [obterEstoqueAtual] Máquina não encontrada:", id);
+      return res.status(404).json({ error: "Máquina não encontrada" });
+    }
+
+    // Buscar última movimentação
+    const ultimaMovimentacao = await Movimentacao.findOne({
+      where: { maquinaId: maquina.id },
+      order: [["dataColeta", "DESC"]],
+    });
+
+    console.log("📦 [obterEstoqueAtual] Última movimentação:", {
+      id: ultimaMovimentacao?.id,
+      dataColeta: ultimaMovimentacao?.dataColeta,
+      totalPre: ultimaMovimentacao?.totalPre,
+      sairam: ultimaMovimentacao?.sairam,
+      abastecidas: ultimaMovimentacao?.abastecidas,
+      totalPos: ultimaMovimentacao?.totalPos,
+    });
+
+    const estoqueAtual = ultimaMovimentacao ? ultimaMovimentacao.totalPos : 0;
+    const percentualEstoque = (estoqueAtual / maquina.capacidadePadrao) * 100;
+    const estoqueMinimo =
+      (maquina.capacidadePadrao * maquina.percentualAlertaEstoque) / 100;
+
+    console.log("✅ [obterEstoqueAtual] Estoque calculado:", {
+      estoqueAtual,
+      percentualEstoque: percentualEstoque.toFixed(2),
+      estoqueMinimo,
+      alertaEstoqueBaixo: estoqueAtual < estoqueMinimo,
+    });
+
+    res.json({
+      maquina: {
+        id: maquina.id,
+        codigo: maquina.codigo,
+        nome: maquina.nome,
+        capacidadePadrao: maquina.capacidadePadrao,
+      },
+      estoqueAtual,
+      percentualEstoque: percentualEstoque.toFixed(2),
+      estoqueMinimo,
+      alertaEstoqueBaixo: estoqueAtual < estoqueMinimo,
+      ultimaAtualizacao: ultimaMovimentacao?.dataColeta,
+    });
+  } catch (error) {
+    console.error("❌ [obterEstoqueAtual] Erro ao obter estoque:", error);
+    res.status(500).json({ error: "Erro ao obter estoque" });
+  }
+};

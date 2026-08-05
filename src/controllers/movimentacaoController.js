@@ -1,0 +1,2708 @@
+import {
+  Movimentacao,
+  MovimentacaoProduto,
+  Maquina,
+  Usuario,
+  Produto,
+  EstoqueLoja,
+  EstoqueUsuario,
+  Loja,
+  CarrinhoPeca,
+  Peca,
+  Manutencao,
+  ContasFinanceiro,
+  FluxoCaixa,
+  ValorEsperadoMovimentacao,
+  Roteiro,
+  RoteiroLoja,
+  UsuarioLoja,
+} from "../models/index.js";
+import { Op } from "sequelize";
+import { randomUUID } from "node:crypto";
+import { registrarMovimentacaoPecas } from "./movimentacaoPecaController.js";
+import justificativasPendentes from "../utils/justificativasPendentes.js";
+import AlertManager from "../services/alertManager.js";
+import { calcularEsperadoMovimentacaoRetirada } from "../services/fluxoCaixaCalculoService.js";
+import { registrarMaquinaConcluidaNaExecucao } from "../utils/roteiroStatusSemanal.js";
+import { resolverContextoExecucaoSemanal } from "../utils/roteiroExecucaoSemanal.js";
+import { parseListParams, buildPaginatedResponse } from "../utils/pagination.js";
+
+const possuiNumero = (valor) =>
+  valor !== null &&
+  valor !== undefined &&
+  valor !== "" &&
+  !Number.isNaN(Number(valor));
+
+const inteiroSeguro = (valor, fallback = 0) => {
+  if (!possuiNumero(valor)) return fallback;
+  return parseInt(valor, 10);
+};
+
+const arredondar2 = (valor) => {
+  if (!possuiNumero(valor)) return null;
+  return Number(Number(valor).toFixed(2));
+};
+
+const normalizarBooleano = (valor, fallback = false) => {
+  if (valor === undefined || valor === null) return fallback;
+  if (typeof valor === "boolean") return valor;
+  if (typeof valor === "number") return valor === 1;
+
+  const texto = String(valor).trim().toLowerCase();
+  if (["true", "1", "sim", "on"].includes(texto)) return true;
+  if (["false", "0", "nao", "não", "off", ""].includes(texto)) return false;
+
+  return fallback;
+};
+
+const DATA_APENAS_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const DATA_HORA_LOCAL_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
+
+const parseDataColetaUsuario = (valor) => {
+  if (!valor) return null;
+
+  if (valor instanceof Date) {
+    return Number.isNaN(valor.getTime()) ? null : valor;
+  }
+
+  const textoBruto = String(valor).trim();
+  if (!textoBruto) return null;
+
+  const texto = textoBruto.replace(" ", "T");
+
+  // Se já vier com timezone (Z ou +/-HH:MM), respeitar o instante enviado.
+  if (/(Z|[+-]\d{2}:\d{2})$/i.test(texto)) {
+    const dataComTz = new Date(texto);
+    return Number.isNaN(dataComTz.getTime()) ? null : dataComTz;
+  }
+
+  // datetime-local sem timezone: interpretar como America/Sao_Paulo.
+  if (DATA_HORA_LOCAL_REGEX.test(texto)) {
+    const normalizada = texto.length === 16 ? `${texto}:00` : texto;
+    const dataLocalBr = new Date(`${normalizada}-03:00`);
+    return Number.isNaN(dataLocalBr.getTime()) ? null : dataLocalBr;
+  }
+
+  if (DATA_APENAS_REGEX.test(texto)) {
+    const dataDiaBr = new Date(`${texto}T00:00:00-03:00`);
+    return Number.isNaN(dataDiaBr.getTime()) ? null : dataDiaBr;
+  }
+
+  const dataGenerica = new Date(texto);
+  return Number.isNaN(dataGenerica.getTime()) ? null : dataGenerica;
+};
+
+const agoraSaoPaulo = () => {
+  const textoLocal = new Date().toLocaleString("sv-SE", {
+    timeZone: "America/Sao_Paulo",
+    hour12: false,
+  });
+  return parseDataColetaUsuario(textoLocal);
+};
+
+const calcularValorEsperadoInicialRetirada = async ({
+  movimentacaoAtual,
+  valorJogada,
+  contadorInAnteriorFallback,
+  contadorOutAnteriorFallback,
+  transaction,
+}) => {
+  const calculo = await calcularEsperadoMovimentacaoRetirada({
+    movimentacaoAtual,
+    valorFicha: valorJogada,
+    contadorInAnteriorFallback,
+    contadorOutAnteriorFallback,
+    permitirFallbackDeltaOut: false,
+    transaction,
+  });
+
+  return calculo.valorEsperadoCalculado;
+};
+
+const calcularContadoresProjetados = (historico) => {
+  let contadorInProjetado = 0;
+  let contadorOutProjetado = 0;
+
+  for (const mov of historico) {
+    const fichas = inteiroSeguro(mov.fichas, 0);
+    const sairam = inteiroSeguro(mov.sairam, 0);
+
+    if (possuiNumero(mov.contadorIn)) {
+      contadorInProjetado = inteiroSeguro(mov.contadorIn, contadorInProjetado);
+    } else {
+      contadorInProjetado += fichas;
+    }
+
+    if (possuiNumero(mov.contadorOut)) {
+      contadorOutProjetado = inteiroSeguro(
+        mov.contadorOut,
+        contadorOutProjetado,
+      );
+    } else {
+      contadorOutProjetado += sairam;
+    }
+  }
+
+  return {
+    contadorInProjetado: Math.max(0, contadorInProjetado),
+    contadorOutProjetado: Math.max(0, contadorOutProjetado),
+  };
+};
+
+const getRequestId = (req) =>
+  req.requestId || req.id || req.headers?.["x-request-id"] || randomUUID();
+
+const logMovimentacao = (level, payload) => {
+  const logger = console[level] || console.log;
+  logger(payload);
+};
+
+export const isErroCriticoMovimentacao = (erro) => {
+  if (!erro) return true;
+  if (erro.name === "SequelizeValidationError") return true;
+  if (erro.name === "SequelizeUniqueConstraintError") return true;
+  if (erro.name === "SequelizeForeignKeyConstraintError") return true;
+  if (erro.name === "SequelizeDatabaseError") return true;
+  if (erro.code === "MOVIMENTACAO_VALIDATION") return true;
+  return false;
+};
+
+const montarPayloadMovimentacaoSucesso = ({
+  movimentacao,
+  movimentacaoAnterior = null,
+  origemEstoqueAplicada,
+  idempotent = false,
+  warnings = [],
+}) => ({
+  id: movimentacao.id,
+  maquinaId: movimentacao.maquinaId,
+  contadores: {
+    contadorIn: movimentacao.contadorIn,
+    contadorOut: movimentacao.contadorOut,
+  },
+  origemEstoqueAplicada,
+  movimentacaoAnteriorId: movimentacaoAnterior?.id || null,
+  idempotent,
+  warnings,
+});
+
+// US08, US09, US10 - Registrar movimentação completa
+export const registrarMovimentacao = async (req, res) => {
+  const requestId = getRequestId(req);
+  const warnings = [];
+
+  // Validação: apenas campos realmente obrigatórios em todos os formulários
+  const requiredFields = ["maquinaId", "totalPre", "abastecidas"];
+  const missing = requiredFields.filter((f) => req.body[f] === undefined);
+  if (missing.length > 0) {
+    return res.status(422).json({
+      error: "Campos obrigatórios ausentes: " + missing.join(", "),
+      code: "MOVIMENTACAO_VALIDATION_REQUIRED_FIELDS",
+      requestId,
+    });
+  }
+
+  logMovimentacao("info", {
+    evento: "movimentacao_post",
+    requestId,
+    etapa: "validacao",
+    maquinaId: req.body?.maquinaId,
+  });
+
+  let transaction = null;
+
+  try {
+    const {
+      maquinaId,
+      dataColeta,
+      totalPre,
+      sairam,
+      abastecidas,
+      fichas,
+      contadorIn,
+      contadorOut,
+      contadorMaquina,
+      contadorInManual,
+      contadorOutManual,
+      contadorInDigital,
+      contadorOutDigital,
+      observacoes,
+      tipoOcorrencia,
+      retiradaEstoque,
+      retiradaDinheiro,
+      retiradaProduto,
+      produtos = [], // Array de { produtoId, quantidadeSaiu, quantidadeAbastecida }
+      roteiroId, // pode não vir do Movimentacoes.jsx
+      quantidade_notas_entrada,
+      valor_entrada_maquininha_pix,
+      ignoreInOut,
+      origemEstoque,
+      confirmarUsoEstoqueLoja,
+      produtoNaMaquinaId,
+      produto_na_maquina_id,
+      contadorInAnterior,
+      contadorOutAnterior,
+      origemCadastroMaquina,
+      tipoMovimentacao,
+    } = req.body;
+
+    const isOrigemCadastroInicial =
+      Boolean(origemCadastroMaquina) ||
+      String(tipoMovimentacao || "").toUpperCase() === "INICIAL";
+    const dataColetaNormalizada =
+      parseDataColetaUsuario(dataColeta) || agoraSaoPaulo();
+    const idempotencyKey = req.headers?.["x-idempotency-key"] || null;
+
+    const origemEstoqueNormalizada =
+      origemEstoque === "loja" ? "loja" : "usuario";
+
+    const isAdmin = ["ADMIN", "GERENCIADOR"].includes(req.usuario?.role);
+    const contadorEhInvalido = (valor) =>
+      valor !== undefined &&
+      valor !== null &&
+      valor !== "" &&
+      (!Number.isInteger(Number(valor)) || Number(valor) < 0);
+
+    if (contadorEhInvalido(contadorIn)) {
+      return res.status(400).json({
+        error: "O contador IN deve ser um número inteiro não negativo.",
+      });
+    }
+
+    if (contadorEhInvalido(contadorOut)) {
+      return res.status(400).json({
+        error: "O contador OUT deve ser um número inteiro não negativo.",
+      });
+    }
+
+    const normalizarContador = (valor) => {
+      if (!possuiNumero(valor)) return null;
+      return Number(valor);
+    };
+
+    const contadorInDigitalSanitizado = normalizarContador(contadorInDigital);
+    const contadorOutDigitalSanitizado = normalizarContador(contadorOutDigital);
+    const contadorInSanitizado =
+      normalizarContador(contadorIn) ?? contadorInDigitalSanitizado ?? null;
+    const contadorOutSanitizado =
+      normalizarContador(contadorOut) ?? contadorOutDigitalSanitizado ?? null;
+    const ignoreInOutNormalizado = normalizarBooleano(ignoreInOut, false);
+    const retiradaDinheiroNormalizada =
+      retiradaDinheiro === undefined || retiradaDinheiro === null
+        ? !ignoreInOutNormalizado &&
+          contadorInSanitizado !== null &&
+          contadorOutSanitizado !== null
+        : normalizarBooleano(retiradaDinheiro, false);
+    const contadorInAnteriorSanitizado = normalizarContador(contadorInAnterior);
+    const contadorOutAnteriorSanitizado =
+      normalizarContador(contadorOutAnterior);
+
+    // (Removido alerta/bloqueio de pular loja: agora permite movimentação em qualquer loja do roteiro)
+
+    // Validações
+    if (!maquinaId || totalPre === undefined || abastecidas === undefined) {
+      return res.status(422).json({
+        error: "maquinaId, totalPre e abastecidas são obrigatórios",
+        code: "MOVIMENTACAO_VALIDATION_REQUIRED_FIELDS",
+        requestId,
+      });
+    }
+
+    const totalPreQtd = inteiroSeguro(totalPre, 0);
+    const sairamQtd = inteiroSeguro(sairam, 0);
+    const abastecidasQtd = inteiroSeguro(abastecidas, 0);
+    const fichasQtd = inteiroSeguro(fichas, 0);
+    const notasEntradaValor = possuiNumero(quantidade_notas_entrada)
+      ? Number(quantidade_notas_entrada)
+      : 0;
+    const pixEntradaValor = possuiNumero(valor_entrada_maquininha_pix)
+      ? Number(valor_entrada_maquininha_pix)
+      : 0;
+
+    const isValorContadorValido = (valor) =>
+      valor !== null &&
+      valor !== undefined &&
+      valor !== "" &&
+      !Number.isNaN(Number(valor));
+
+    const contadorInInformado = contadorInSanitizado;
+    const contadorOutInformado = contadorOutSanitizado;
+
+    const precisaInOut = [
+      "FUNCIONARIO_TODAS_LOJAS",
+      "CONTROLADOR_ESTOQUE",
+    ].includes(req.usuario?.role);
+
+    if (
+      precisaInOut &&
+      !ignoreInOutNormalizado &&
+      (!isValorContadorValido(contadorInInformado) ||
+        !isValorContadorValido(contadorOutInformado))
+    ) {
+      return res.status(422).json({
+        error:
+          "Para FUNCIONARIO_TODAS_LOJAS e CONTROLADOR_ESTOQUE, os campos IN/OUT são obrigatórios. Marque a opção de ignorar IN/OUT para continuar sem eles.",
+        code: "MOVIMENTACAO_VALIDATION_COUNTERS_REQUIRED",
+        requestId,
+      });
+    }
+
+    // --- REGRA DE SEGURANÇA: Não permitir total maior que totalPos da última movimentação, exceto para ADMIN ---
+    const ultimaMov = await Movimentacao.findOne({
+      where: { maquinaId },
+      order: [
+        ["dataColeta", "DESC"],
+        ["createdAt", "DESC"],
+        ["id", "DESC"],
+      ],
+    });
+    const isPrimeiraMovimentacao = !ultimaMov;
+
+    if (
+      isPrimeiraMovimentacao &&
+      (!isValorContadorValido(contadorInAnteriorSanitizado) ||
+        !isValorContadorValido(contadorOutAnteriorSanitizado) ||
+        !isValorContadorValido(contadorInSanitizado) ||
+        !isValorContadorValido(contadorOutSanitizado))
+    ) {
+      return res.status(422).json({
+        error:
+          "Na primeira movimentação da máquina, os campos contadorInAnterior, contadorOutAnterior, contadorIn e contadorOut são obrigatórios.",
+        code: "MOVIMENTACAO_VALIDATION_FIRST_COUNTERS_REQUIRED",
+        requestId,
+      });
+    }
+
+    if (
+      isPrimeiraMovimentacao &&
+      !isAdmin &&
+      isValorContadorValido(contadorInAnteriorSanitizado) &&
+      isValorContadorValido(contadorInSanitizado) &&
+      contadorInAnteriorSanitizado > contadorInSanitizado
+    ) {
+      return res.status(422).json({
+        error:
+          "Na primeira movimentação, contadorInAnterior não pode ser maior que contadorIn.",
+        code: "MOVIMENTACAO_VALIDATION_FIRST_COUNTER_IN_INVALID",
+        requestId,
+      });
+    }
+
+    if (
+      isPrimeiraMovimentacao &&
+      !isAdmin &&
+      isValorContadorValido(contadorOutAnteriorSanitizado) &&
+      isValorContadorValido(contadorOutSanitizado) &&
+      contadorOutAnteriorSanitizado > contadorOutSanitizado
+    ) {
+      return res.status(422).json({
+        error:
+          "Na primeira movimentação, contadorOutAnterior não pode ser maior que contadorOut.",
+        code: "MOVIMENTACAO_VALIDATION_FIRST_COUNTER_OUT_INVALID",
+        requestId,
+      });
+    }
+
+    if (isPrimeiraMovimentacao && isOrigemCadastroInicial) {
+      const janelaIdempotencia = new Date(Date.now() - 10 * 60 * 1000);
+      const whereIdempotencia = {
+        maquinaId,
+        usuarioId: req.usuario.id,
+        contadorIn: contadorInSanitizado,
+        contadorOut: contadorOutSanitizado,
+        createdAt: { [Op.gte]: janelaIdempotencia },
+      };
+
+      if (idempotencyKey) {
+        whereIdempotencia.observacoes = observacoes;
+      }
+
+      const movimentacaoExistente = await Movimentacao.findOne({
+        where: whereIdempotencia,
+        order: [["createdAt", "DESC"]],
+      });
+
+      if (movimentacaoExistente) {
+        logMovimentacao("warn", {
+          evento: "movimentacao_idempotencia_reaproveitada",
+          requestId,
+          etapa: "persistencia",
+          maquinaId,
+          movimentacaoId: movimentacaoExistente.id,
+          idempotencyKey,
+        });
+
+        return res.status(200).json(
+          montarPayloadMovimentacaoSucesso({
+            movimentacao: movimentacaoExistente,
+            origemEstoqueAplicada: origemEstoqueNormalizada,
+            idempotent: true,
+          }),
+        );
+      }
+    }
+
+    const historicoContadores = await Movimentacao.findAll({
+      where: { maquinaId },
+      attributes: [
+        "contadorIn",
+        "contadorOut",
+        "fichas",
+        "sairam",
+        "dataColeta",
+        "createdAt",
+      ],
+      order: [
+        ["dataColeta", "ASC"],
+        ["createdAt", "ASC"],
+      ],
+    });
+
+    const { contadorOutProjetado } =
+      calcularContadoresProjetados(historicoContadores);
+
+    // Validação: somente ADMIN pode digitar IN/OUT livremente
+    if (ultimaMov) {
+      // IN não pode ser menor que o anterior para não-admin
+      if (
+        isValorContadorValido(contadorInSanitizado) &&
+        isValorContadorValido(ultimaMov.contadorIn) &&
+        contadorInSanitizado < inteiroSeguro(ultimaMov.contadorIn, 0) &&
+        !isAdmin
+      ) {
+        return res.status(400).json({
+          error: `O contador IN (${contadorInSanitizado}) não pode ser menor que o anterior (${inteiroSeguro(ultimaMov.contadorIn, 0)}). Apenas ADMIN ou GERENCIADOR pode informar IN/OUT livremente.`,
+        });
+      }
+
+      // OUT não pode ser menor que o anterior para não-admin,
+      // exceto quando for exatamente o valor sugerido.
+      const outAnterior = inteiroSeguro(ultimaMov.contadorOut, 0);
+      const outDigitado = contadorOutSanitizado;
+      const outSugerido = inteiroSeguro(contadorOutProjetado, 0);
+      const outMenorQueAnterior =
+        isValorContadorValido(outDigitado) &&
+        isValorContadorValido(ultimaMov.contadorOut) &&
+        outDigitado < outAnterior;
+      const outEhSugerido =
+        isValorContadorValido(outDigitado) && outDigitado === outSugerido;
+
+      if (!isAdmin && outMenorQueAnterior && !outEhSugerido) {
+        return res.status(400).json({
+          error: `O contador OUT (${outDigitado}) não pode ser menor que o anterior (${outAnterior}). Se OUT ficar abaixo do anterior, somente o valor sugerido (${outSugerido}) é permitido.`,
+        });
+      }
+    }
+    // Validação de totalPre > totalPos removida: permitido lançar mesmo quando totalPre ultrapassa totalPos anterior.
+
+    // --- Recalcular saída (sairam) para garantir consistência ---
+    // Regra de negócio: saída = totalPos da última movimentação - total atual informado.
+    let saidaRecalculada = 0;
+    if (ultimaMov) {
+      saidaRecalculada = Math.max(
+        0,
+        inteiroSeguro(ultimaMov.totalPos, 0) - totalPreQtd,
+      );
+    }
+    // Se não houver movimentação anterior, saída é zero
+
+    // Buscar máquina para pegar valorFicha
+    const maquina = await Maquina.findByPk(maquinaId);
+    if (!maquina) {
+      return res.status(404).json({ error: "Máquina não encontrada" });
+    }
+
+    const produtoComSaida = Array.isArray(produtos)
+      ? produtos.find((item) => Number(item?.quantidadeSaiu || 0) > 0)
+      : null;
+
+    const produtoComAbastecimentoPrincipal = Array.isArray(produtos)
+      ? produtos.find((item) => Number(item?.quantidadeAbastecida || 0) > 0)
+      : null;
+
+    const primeiroProdutoInformado = Array.isArray(produtos)
+      ? produtos.find((item) => item?.produtoId)
+      : null;
+
+    const produtoNaMaquinaIdFinal =
+      produtoNaMaquinaId ||
+      produto_na_maquina_id ||
+      produtoComSaida?.produtoId ||
+      produtoComAbastecimentoPrincipal?.produtoId ||
+      primeiroProdutoInformado?.produtoId ||
+      null;
+
+    if (produtoNaMaquinaIdFinal) {
+      const produtoNaMaquinaExiste = await Produto.findByPk(
+        produtoNaMaquinaIdFinal,
+        {
+          attributes: ["id"],
+        },
+      );
+      if (!produtoNaMaquinaExiste) {
+        return res.status(400).json({
+          error:
+            "produtoNaMaquinaId informado não existe no cadastro de produtos",
+        });
+      }
+    }
+
+    const produtosComAbastecimento = Array.isArray(produtos)
+      ? produtos.filter((item) => Number(item?.quantidadeAbastecida || 0) > 0)
+      : [];
+
+    if (produtosComAbastecimento.length > 0) {
+      const saldoUsuarioCache = new Map();
+      const saldoLojaCache = new Map();
+      const insuficientes = [];
+      const exigeConfirmacaoUsoLoja = [];
+
+      const obterSaldoUsuario = async (produtoId) => {
+        if (saldoUsuarioCache.has(produtoId)) {
+          return saldoUsuarioCache.get(produtoId);
+        }
+
+        const estoqueUsuario = await EstoqueUsuario.findOne({
+          where: {
+            usuarioId: req.usuario.id,
+            produtoId,
+          },
+        });
+
+        const saldo = Number(estoqueUsuario?.quantidade || 0);
+        saldoUsuarioCache.set(produtoId, saldo);
+        return saldo;
+      };
+
+      const obterSaldoLoja = async (produtoId) => {
+        if (saldoLojaCache.has(produtoId)) {
+          return saldoLojaCache.get(produtoId);
+        }
+
+        const estoqueLoja = await EstoqueLoja.findOne({
+          where: {
+            lojaId: maquina.lojaId,
+            produtoId,
+          },
+        });
+
+        const saldo = Number(estoqueLoja?.quantidade || 0);
+        saldoLojaCache.set(produtoId, saldo);
+        return saldo;
+      };
+
+      for (const item of produtosComAbastecimento) {
+        const produto = await Produto.findByPk(item.produtoId, {
+          attributes: ["id", "nome"],
+        });
+
+        if (!produto) {
+          continue;
+        }
+
+        const quantidadeSolicitada = Number(item.quantidadeAbastecida || 0);
+
+        if (origemEstoqueNormalizada === "usuario") {
+          const saldoUsuario = await obterSaldoUsuario(item.produtoId);
+
+          if (saldoUsuario < quantidadeSolicitada) {
+            insuficientes.push({
+              produtoId: item.produtoId,
+              produtoNome: produto.nome,
+              quantidadeSolicitada,
+              saldoDisponivel: saldoUsuario,
+              origemEstoque: "usuario",
+            });
+          }
+          continue;
+        }
+
+        const saldoLoja = await obterSaldoLoja(item.produtoId);
+        if (saldoLoja < quantidadeSolicitada) {
+          insuficientes.push({
+            produtoId: item.produtoId,
+            produtoNome: produto.nome,
+            quantidadeSolicitada,
+            saldoDisponivel: saldoLoja,
+            origemEstoque: "loja",
+          });
+        }
+
+        const saldoUsuario = await obterSaldoUsuario(item.produtoId);
+        if (!confirmarUsoEstoqueLoja && saldoUsuario > 0) {
+          exigeConfirmacaoUsoLoja.push({
+            produtoId: item.produtoId,
+            produtoNome: produto.nome,
+            saldoUsuario,
+            quantidadeSolicitada,
+          });
+        }
+      }
+
+      if (insuficientes.length > 0) {
+        return res.status(400).json({
+          error: `Estoque ${origemEstoqueNormalizada} insuficiente para concluir a movimentação`,
+          origemEstoque: origemEstoqueNormalizada,
+          detalhes: insuficientes,
+        });
+      }
+
+      if (
+        origemEstoqueNormalizada === "loja" &&
+        !confirmarUsoEstoqueLoja &&
+        exigeConfirmacaoUsoLoja.length > 0
+      ) {
+        return res.status(409).json({
+          error:
+            "Voce possui saldo no estoque pessoal para um ou mais produtos. Confirme se deseja retirar da loja mesmo assim.",
+          codigo: "CONFIRMAR_USO_ESTOQUE_LOJA",
+          origemEstoque: origemEstoqueNormalizada,
+          detalhes: exigeConfirmacaoUsoLoja,
+        });
+      }
+    }
+
+    // valorFaturado = fichas * valorFicha + dinheiro(notas) + pix/cartão
+
+    const aplicarAjustePrimeiraMov =
+      isPrimeiraMovimentacao && isOrigemCadastroInicial;
+
+    const totalPrePadraoPrimeira = isPrimeiraMovimentacao
+      ? inteiroSeguro(maquina.capacidadePadrao, 100)
+      : null;
+    const deltaInPrimeira = isPrimeiraMovimentacao
+      ? Math.max(0, contadorInSanitizado - contadorInAnteriorSanitizado)
+      : 0;
+    const deltaOutPrimeira = isPrimeiraMovimentacao
+      ? Math.max(0, contadorOutSanitizado - contadorOutAnteriorSanitizado)
+      : 0;
+    const totalPrePrincipal = aplicarAjustePrimeiraMov
+      ? Math.max(0, totalPrePadraoPrimeira - deltaOutPrimeira)
+      : totalPreQtd;
+    const sairamPrincipal = aplicarAjustePrimeiraMov
+      ? deltaOutPrimeira
+      : isPrimeiraMovimentacao
+        ? deltaOutPrimeira
+        : saidaRecalculada;
+    const abastecidasPrincipal = aplicarAjustePrimeiraMov
+      ? deltaInPrimeira
+      : abastecidasQtd;
+
+    console.log("📝 [registrarMovimentacao] Criando movimentação:", {
+      maquinaId,
+      totalPre: totalPrePrincipal,
+      sairam: sairamPrincipal,
+      abastecidas: abastecidasPrincipal,
+      totalPosCalculado:
+        totalPrePrincipal - sairamPrincipal + abastecidasPrincipal,
+      isPrimeiraMovimentacao,
+    });
+
+    // Criar movimentação — persistir TODOS os campos enviados pelo frontend
+    const valorFaturado =
+      fichasQtd * parseFloat(maquina.valorFicha || 0) +
+      notasEntradaValor +
+      pixEntradaValor;
+
+    // Verificar justificativa de quebra de ordem pendente para esta loja
+    const justificativaPendente = maquina.lojaId
+      ? justificativasPendentes.get(maquina.lojaId)
+      : null;
+
+    let movimentacaoAnterior = null;
+    transaction = await Movimentacao.sequelize.transaction();
+
+    if (isPrimeiraMovimentacao) {
+      const inAnterior = inteiroSeguro(contadorInAnteriorSanitizado, 0);
+      const outAnterior = inteiroSeguro(contadorOutAnteriorSanitizado, 0);
+
+      movimentacaoAnterior = await Movimentacao.create(
+        {
+          maquinaId,
+          usuarioId: req.usuario.id,
+          dataColeta: dataColetaNormalizada,
+          totalPre: totalPrePadraoPrimeira,
+          sairam: 0,
+          abastecidas: 0,
+          fichas: fichasQtd,
+          valorFaturado: parseFloat(valorFaturado.toFixed(2)),
+          contadorIn: inAnterior,
+          contadorInDigital: inAnterior,
+          contadorInAnterior: inAnterior,
+          contadorOut: outAnterior,
+          contadorOutDigital: outAnterior,
+          contadorOutAnterior: outAnterior,
+          contadorMaquina: contadorMaquina ?? null,
+          quantidade_notas_entrada: possuiNumero(quantidade_notas_entrada)
+            ? notasEntradaValor
+            : null,
+          valor_entrada_maquininha_pix: possuiNumero(
+            valor_entrada_maquininha_pix,
+          )
+            ? pixEntradaValor
+            : null,
+          observacoes,
+          tipoOcorrencia: tipoOcorrencia || "Normal",
+          retiradaEstoque: retiradaEstoque || false,
+          retiradaDinheiro: retiradaDinheiroNormalizada,
+          produtoNaMaquinaId: produtoNaMaquinaIdFinal,
+          roteiroId: roteiroId ?? justificativaPendente?.roteiroId ?? null,
+          justificativa_ordem: justificativaPendente?.justificativa ?? null,
+          totalPos: totalPrePadraoPrimeira,
+        },
+        { transaction },
+      );
+
+      console.log(
+        "🧭 [registrarMovimentacao] Primeira movimentação detectada. Registro de contadores anteriores criado:",
+        {
+          maquinaId,
+          movimentacaoAnteriorId: movimentacaoAnterior.id,
+          contadorInAnterior: inAnterior,
+          contadorOutAnterior: outAnterior,
+          totalPrePadraoPrimeira,
+        },
+      );
+    }
+
+    const movimentacao = await Movimentacao.create(
+      {
+        maquinaId,
+        usuarioId: req.usuario.id,
+        dataColeta: dataColetaNormalizada,
+        totalPre: totalPrePrincipal,
+        sairam: sairamPrincipal,
+        abastecidas: abastecidasPrincipal,
+        fichas: fichasQtd,
+        valorFaturado: parseFloat(valorFaturado.toFixed(2)),
+        contadorIn: contadorInSanitizado,
+        contadorInDigital: contadorInDigitalSanitizado,
+        contadorInAnterior: contadorInAnteriorSanitizado,
+        contadorOut: contadorOutSanitizado,
+        contadorOutDigital: contadorOutDigitalSanitizado,
+        contadorOutAnterior: contadorOutAnteriorSanitizado,
+        contadorMaquina: contadorMaquina ?? null,
+        quantidade_notas_entrada: possuiNumero(quantidade_notas_entrada)
+          ? notasEntradaValor
+          : null,
+        valor_entrada_maquininha_pix: possuiNumero(valor_entrada_maquininha_pix)
+          ? pixEntradaValor
+          : null,
+        observacoes,
+        tipoOcorrencia: tipoOcorrencia || "Normal",
+        retiradaEstoque: retiradaEstoque || false,
+        retiradaDinheiro: retiradaDinheiroNormalizada,
+        produtoNaMaquinaId: produtoNaMaquinaIdFinal,
+        roteiroId: roteiroId ?? justificativaPendente?.roteiroId ?? null,
+        justificativa_ordem: justificativaPendente?.justificativa ?? null,
+      },
+      { transaction },
+    );
+
+    // Consumir justificativa pendente após usá-la
+    if (justificativaPendente && maquina.lojaId) {
+      justificativasPendentes.delete(maquina.lojaId);
+    }
+
+    // Se a movimentação é marcada como retirada de dinheiro, criar registro no FluxoCaixa
+    if (retiradaDinheiroNormalizada) {
+      const valorEsperadoCalculadoInicial =
+        await calcularValorEsperadoInicialRetirada({
+          movimentacaoAtual: movimentacao,
+          valorJogada: maquina.valorFicha,
+          contadorInAnteriorFallback: contadorInAnteriorSanitizado,
+          contadorOutAnteriorFallback: contadorOutAnteriorSanitizado,
+          transaction,
+        });
+
+      await FluxoCaixa.create(
+        {
+          movimentacaoId: movimentacao.id,
+          valorEsperado: valorEsperadoCalculadoInicial,
+          conferencia: "pendente",
+        },
+        { transaction },
+      );
+
+      // Salvar valor esperado na tabela dedicada para uso nos relatórios
+      const valorParaSalvar =
+        valorEsperadoCalculadoInicial ?? movimentacao.valorFaturado ?? 0;
+      await ValorEsperadoMovimentacao.create(
+        {
+          movimentacaoId: movimentacao.id,
+          maquinaId: movimentacao.maquinaId,
+          lojaId: maquina.lojaId,
+          roteiroId: movimentacao.roteiroId ?? null,
+          valorEsperado: parseFloat(Number(valorParaSalvar).toFixed(2)),
+          dataColeta: movimentacao.dataColeta,
+        },
+        { transaction },
+      );
+      console.log(
+        "✅ [registrarMovimentacao] Registro de FluxoCaixa criado para movimentação:",
+        {
+          movimentacaoId: movimentacao.id,
+          valorEsperadoInicial: valorEsperadoCalculadoInicial,
+        },
+      );
+    }
+
+    // Registrar peças usadas, se houver
+    if (
+      req.body.pecasUsadas &&
+      Array.isArray(req.body.pecasUsadas) &&
+      req.body.pecasUsadas.length > 0
+    ) {
+      await registrarMovimentacaoPecas(movimentacao.id, req.body.pecasUsadas, {
+        transaction,
+      });
+    }
+
+    console.log("✅ [registrarMovimentacao] Movimentação criada:", {
+      id: movimentacao.id,
+      totalPre: movimentacao.totalPre,
+      sairam: movimentacao.sairam,
+      abastecidas: movimentacao.abastecidas,
+      totalPos: movimentacao.totalPos,
+    });
+
+    const produtoIdsAjustadosNoEstoqueLoja = new Set();
+
+    // Se produtos foram informados, registrar detalhes
+    if (produtos && produtos.length > 0) {
+      let detalhesProdutos = [];
+      let pecasParaMovimentacao = [];
+      for (const p of produtos) {
+        // Verifica se é produto
+        const produtoExiste = await Produto.findByPk(p.produtoId);
+        if (produtoExiste) {
+          detalhesProdutos.push({
+            movimentacaoId: movimentacao.id,
+            produtoId: p.produtoId,
+            quantidadeSaiu: p.quantidadeSaiu || 0,
+            quantidadeAbastecida: p.quantidadeAbastecida || 0,
+            retiradaProduto: p.retiradaProduto || 0,
+          });
+        } else {
+          // Verifica se é peça
+          const pecaExiste = await Peca.findByPk(p.produtoId);
+          if (pecaExiste) {
+            pecasParaMovimentacao.push({
+              pecaId: p.produtoId,
+              quantidade: p.quantidadeSaiu || 0,
+              nome: pecaExiste.nome,
+              usuarioId: req.usuario.id,
+            });
+            // Remove do carrinho do usuário (remover múltiplas desativado)
+          }
+        }
+      }
+      if (detalhesProdutos.length > 0) {
+        await MovimentacaoProduto.bulkCreate(detalhesProdutos, { transaction });
+        // Atualiza estoque de origem para produtos abastecidos
+        for (const produto of detalhesProdutos) {
+          if (
+            produto.quantidadeAbastecida &&
+            produto.quantidadeAbastecida > 0
+          ) {
+            if (origemEstoqueNormalizada === "loja") {
+              const estoqueLoja = await EstoqueLoja.findOne({
+                where: {
+                  lojaId: maquina.lojaId,
+                  produtoId: produto.produtoId,
+                },
+              });
+
+              if (estoqueLoja) {
+                const novaQuantidade = Math.max(
+                  0,
+                  estoqueLoja.quantidade - produto.quantidadeAbastecida,
+                );
+                await estoqueLoja.update(
+                  { quantidade: novaQuantidade },
+                  { transaction },
+                );
+                produtoIdsAjustadosNoEstoqueLoja.add(produto.produtoId);
+              }
+            } else {
+              const estoqueUsuario = await EstoqueUsuario.findOne({
+                where: {
+                  usuarioId: req.usuario.id,
+                  produtoId: produto.produtoId,
+                },
+              });
+
+              if (estoqueUsuario) {
+                const novaQuantidade = Math.max(
+                  0,
+                  estoqueUsuario.quantidade - produto.quantidadeAbastecida,
+                );
+                await estoqueUsuario.update(
+                  { quantidade: novaQuantidade },
+                  { transaction },
+                );
+              }
+            }
+          }
+        }
+      }
+      if (pecasParaMovimentacao.length > 0) {
+        await registrarMovimentacaoPecas(
+          movimentacao.id,
+          pecasParaMovimentacao,
+          { transaction },
+        );
+      }
+    }
+
+    // Se for devolução ao estoque da loja, somar retiradaProduto
+    for (const produto of produtos) {
+      if (
+        produto.retiradaProdutoDevolverEstoque &&
+        produto.retiradaProduto > 0
+      ) {
+        const estoqueLoja = await EstoqueLoja.findOne({
+          where: {
+            lojaId: maquina.lojaId,
+            produtoId: produto.produtoId,
+          },
+        });
+        if (estoqueLoja) {
+          const quantidadeAnterior = estoqueLoja.quantidade;
+          const novaQuantidade = quantidadeAnterior + produto.retiradaProduto;
+          await estoqueLoja.update(
+            { quantidade: novaQuantidade },
+            { transaction },
+          );
+          produtoIdsAjustadosNoEstoqueLoja.add(produto.produtoId);
+          console.log(
+            "✅ [registrarMovimentacao] Devolução: retirada devolvida ao estoque da loja:",
+            {
+              produtoId: produto.produtoId,
+              quantidadeAnterior,
+              devolvida: produto.retiradaProduto,
+              novaQuantidade,
+            },
+          );
+        } else {
+          console.log(
+            "⚠️ [registrarMovimentacao] Estoque da loja não encontrado para devolução:",
+            {
+              lojaId: maquina.lojaId,
+              produtoId: produto.produtoId,
+            },
+          );
+        }
+      }
+    }
+
+    await transaction.commit();
+    transaction = null;
+
+    try {
+      if (
+        origemEstoqueNormalizada === "loja" &&
+        produtoIdsAjustadosNoEstoqueLoja.size > 0
+      ) {
+        const lojaAlerta = await Loja.findByPk(maquina.lojaId, {
+          attributes: ["id", "nome", "telefone"],
+        });
+
+        const destinatarioAlerta =
+          lojaAlerta?.telefone || process.env.WHATSAPP_ALERT_DESTINO || null;
+
+        if (destinatarioAlerta) {
+          const estoquesAjustados = await EstoqueLoja.findAll({
+            where: {
+              lojaId: maquina.lojaId,
+              produtoId: {
+                [Op.in]: Array.from(produtoIdsAjustadosNoEstoqueLoja),
+              },
+            },
+            include: [
+              {
+                model: Produto,
+                as: "produto",
+                attributes: ["id", "nome", "estoqueMinimo"],
+              },
+            ],
+          });
+
+          for (const estoqueItem of estoquesAjustados) {
+            const minimoDefinido = Number(
+              estoqueItem.estoqueMinimo ??
+                estoqueItem.produto?.estoqueMinimo ??
+                0,
+            );
+
+            if (Number(estoqueItem.quantidade) > minimoDefinido) {
+              continue;
+            }
+
+            AlertManager.estoqueCritico({
+              nomeUsuario: req.usuario?.nome || "Sistema",
+              telefoneChefe: destinatarioAlerta,
+              nomeMaquina:
+                maquina.nome || `Loja ${lojaAlerta?.nome || maquina.lojaId}`,
+              produto: estoqueItem.produto?.nome || estoqueItem.produtoId,
+              quantidadeAtual: Number(estoqueItem.quantidade),
+              estoqueMinimo: minimoDefinido,
+              referenciaTipo: "estoque_loja",
+              referenciaId: estoqueItem.id,
+            }).catch((erroAlerta) => {
+              logMovimentacao("warn", {
+                evento: "movimentacao_pos_processamento_alerta_erro",
+                requestId,
+                etapa: "pos-processamento",
+                erro: erroAlerta.message,
+                movimentacaoId: movimentacao.id,
+              });
+            });
+          }
+        }
+      }
+    } catch (erroSecundario) {
+      warnings.push("Falha ao processar alertas de estoque");
+      logMovimentacao("warn", {
+        evento: "movimentacao_pos_processamento_erro",
+        requestId,
+        etapa: "pos-processamento",
+        bloco: "alertas_estoque",
+        erro: erroSecundario.message,
+      });
+    }
+
+    try {
+      await registrarMaquinaConcluidaNaExecucao({
+        maquinaId,
+        roteiroId: movimentacao.roteiroId,
+        data: movimentacao.dataColeta,
+      });
+    } catch (erroSecundario) {
+      warnings.push("Falha ao atualizar status diario da movimentacao");
+      logMovimentacao("warn", {
+        evento: "movimentacao_pos_processamento_erro",
+        requestId,
+        etapa: "pos-processamento",
+        bloco: "status_diario",
+        erro: erroSecundario.message,
+      });
+    }
+
+    try {
+      const pecasUsadas = req.body.pecasUsadas;
+      if (pecasUsadas && Array.isArray(pecasUsadas) && pecasUsadas.length > 0) {
+        const usuarioId = req.usuario.id;
+        for (const peca of pecasUsadas) {
+          await CarrinhoPeca.destroy({
+            where: {
+              usuarioId,
+              pecaId: peca.pecaId,
+            },
+          });
+        }
+      }
+    } catch (erroSecundario) {
+      warnings.push("Falha ao limpar carrinho de pecas usadas");
+      logMovimentacao("warn", {
+        evento: "movimentacao_pos_processamento_erro",
+        requestId,
+        etapa: "pos-processamento",
+        bloco: "limpeza_carrinho",
+        erro: erroSecundario.message,
+      });
+    }
+
+    let payloadResposta = montarPayloadMovimentacaoSucesso({
+      movimentacao,
+      movimentacaoAnterior,
+      origemEstoqueAplicada: origemEstoqueNormalizada,
+      warnings,
+    });
+
+    try {
+      const movimentacaoCompleta = await Movimentacao.findByPk(
+        movimentacao.id,
+        {
+          include: [
+            {
+              model: Maquina,
+              as: "maquina",
+              attributes: ["id", "codigo", "nome", "lojaId"],
+            },
+            {
+              model: Usuario,
+              as: "usuario",
+              attributes: ["id", "nome", "email"],
+            },
+            {
+              model: MovimentacaoProduto,
+              as: "detalhesProdutos",
+              include: [
+                {
+                  model: Produto,
+                  as: "produto",
+                  attributes: ["id", "nome", "categoria"],
+                },
+              ],
+            },
+          ],
+        },
+      );
+
+      if (movimentacaoCompleta) {
+        payloadResposta = {
+          ...movimentacaoCompleta.toJSON(),
+          ...payloadResposta,
+        };
+      }
+    } catch (erroSecundario) {
+      warnings.push("Falha ao montar resposta completa da movimentacao");
+      logMovimentacao("warn", {
+        evento: "movimentacao_pos_processamento_erro",
+        requestId,
+        etapa: "resposta",
+        bloco: "montagem_payload",
+        erro: erroSecundario.message,
+      });
+    }
+
+    res.locals.entityId = movimentacao.id;
+    res.status(201).json(payloadResposta);
+    return;
+  } catch (error) {
+    if (transaction) {
+      await transaction.rollback();
+    }
+
+    const erroCritico = isErroCriticoMovimentacao(error);
+    const statusCode = erroCritico ? 500 : 422;
+    const codigo = erroCritico
+      ? "MOVIMENTACAO_INTERNAL_ERROR"
+      : "MOVIMENTACAO_VALIDATION_ERROR";
+
+    logMovimentacao("error", {
+      evento: "movimentacao_erro",
+      requestId,
+      etapa: "persistencia",
+      erro: error.message,
+      stack: error.stack,
+      code: error.code,
+      tipo: error.name,
+    });
+
+    res.status(statusCode).json({
+      error: erroCritico
+        ? "Erro interno ao registrar movimentação"
+        : "Erro de validação ao registrar movimentação",
+      code: codigo,
+      requestId,
+    });
+  }
+};
+
+// Listar movimentações com filtros
+export const listarMovimentacoes = async (req, res) => {
+  try {
+    const {
+      lojaId,
+      maquinaId,
+      apenasJustificativasNovas,
+      dataInicio,
+      dataFim,
+    } = req.query;
+    // Aceita `limite` (nome legado) como sinônimo de pageSize
+    const params = parseListParams(
+      { ...req.query, pageSize: req.query.pageSize || req.query.limite },
+      { defaultPageSize: 25, maxPageSize: 5000 },
+    );
+    const where = {};
+    if (maquinaId) where.maquinaId = maquinaId;
+    if (apenasJustificativasNovas === "true") {
+      where.status_justificativa = "nova";
+    }
+    if (dataInicio || dataFim) {
+      const inicio = dataInicio ? new Date(`${dataInicio}T00:00:00`) : new Date(0);
+      const fim = dataFim ? new Date(`${dataFim}T23:59:59.999`) : new Date();
+      where.dataColeta = { [Op.between]: [inicio, fim] };
+    }
+    const include = [
+      {
+        model: Maquina,
+        as: "maquina",
+        attributes: ["id", "codigo", "nome", "lojaId"],
+        ...(lojaId ? { where: { lojaId } } : {}),
+      },
+      {
+        model: Usuario,
+        as: "usuario",
+        attributes: ["id", "nome"],
+      },
+      {
+        model: MovimentacaoProduto,
+        as: "detalhesProdutos",
+        include: [
+          {
+            model: Produto,
+            as: "produto",
+            attributes: ["id", "nome"],
+          },
+        ],
+      },
+      {
+        association: "pecasUsadas",
+        include: [{ model: Peca }],
+      },
+    ];
+
+    const { rows: movimentacoes, count } = await Movimentacao.findAndCountAll({
+      where,
+      include,
+      order: [
+        ["dataColeta", "DESC"],
+        ["createdAt", "DESC"],
+        ["id", "DESC"],
+      ],
+      limit: params.limit,
+      offset: params.offset,
+      distinct: true,
+    });
+
+    // Normaliza a resposta: expõe lojaId diretamente (via maquina.lojaId)
+    const LogOrdemRoteiro = (await import("../models/LogOrdemRoteiro.js"))
+      .default;
+    const result = await Promise.all(
+      movimentacoes.map(async (mov) => {
+        const json = mov.toJSON();
+        if (!json.lojaId && json.maquina?.lojaId) {
+          json.lojaId = json.maquina.lojaId;
+        }
+        // Se houve quebra de ordem, buscar info do log
+        if (json.justificativa_ordem) {
+          const log = await LogOrdemRoteiro.findOne({
+            where: {
+              lojaId: json.lojaId,
+              justificativa: json.justificativa_ordem,
+            },
+            order: [["createdAt", "DESC"]],
+          });
+          if (log) {
+            json.lojaIdEsperada = log.lojaEsperadaId || null;
+            json.lojaEsperadaNome = log.lojaEsperadaNome || null;
+          } else {
+            json.lojaIdEsperada = null;
+            json.lojaEsperadaNome = null;
+          }
+        } else {
+          json.lojaIdEsperada = null;
+          json.lojaEsperadaNome = null;
+        }
+        // Expor nome da loja visitada
+        json.lojaNome = json.maquina?.loja?.nome || null;
+        return json;
+      }),
+    );
+    res.json(buildPaginatedResponse(result, count, params));
+  } catch (error) {
+    console.error("Erro ao listar movimentações:", error);
+    res.status(500).json({ error: "Erro ao listar movimentações" });
+  }
+};
+
+// Obter movimentação por ID
+export const obterMovimentacao = async (req, res) => {
+  try {
+    const movimentacao = await Movimentacao.findByPk(req.params.id, {
+      include: [
+        {
+          model: Maquina,
+          as: "maquina",
+          include: [
+            {
+              model: Loja,
+              as: "loja",
+              attributes: ["id", "nome"],
+            },
+          ],
+        },
+        {
+          model: Usuario,
+          as: "usuario",
+          attributes: ["id", "nome", "email"],
+        },
+        {
+          model: MovimentacaoProduto,
+          as: "detalhesProdutos",
+          include: [
+            {
+              model: Produto,
+              as: "produto",
+            },
+          ],
+        },
+        {
+          association: "pecasUsadas",
+          include: [{ model: Peca }],
+        },
+      ],
+    });
+
+    if (!movimentacao) {
+      return res.status(404).json({ error: "Movimentação não encontrada" });
+    }
+
+    res.json(movimentacao);
+  } catch (error) {
+    console.error("Erro ao obter movimentação:", error);
+    res.status(500).json({ error: "Erro ao obter movimentação" });
+  }
+};
+
+// Atualizar movimentação (permite editar campos principais)
+export const atualizarMovimentacao = async (req, res) => {
+  let transaction = null;
+  try {
+    transaction = await Movimentacao.sequelize.transaction();
+
+    const movimentacao = await Movimentacao.findByPk(req.params.id, {
+      include: [{ model: MovimentacaoProduto, as: "detalhesProdutos" }],
+      transaction,
+    });
+
+    if (!movimentacao) {
+      await transaction.rollback();
+      return res.status(404).json({ error: "Movimentação não encontrada" });
+    }
+
+    // Apenas admin ou o próprio usuário que criou pode editar
+    if (
+      !["ADMIN", "GERENCIADOR"].includes(req.usuario.role) &&
+      movimentacao.usuarioId !== req.usuario.id
+    ) {
+      await transaction.rollback();
+      return res
+        .status(403)
+        .json({ error: "Você não pode editar esta movimentação" });
+    }
+
+    const {
+      observacoes,
+      tipoOcorrencia,
+      fichas,
+      totalPre,
+      sairam,
+      abastecidas,
+      contadorIn,
+      contadorOut,
+      contadorMaquina,
+      quantidade_notas_entrada,
+      valor_entrada_maquininha_pix,
+      dataColeta,
+      produtoId,
+    } = req.body;
+
+    if (totalPre !== undefined && req.usuario.role !== "ADMIN") {
+      await transaction.rollback();
+      return res.status(403).json({
+        error: "Somente ADMIN pode editar a quantidade pre de produtos.",
+        code: "MOVIMENTACAO_TOTAL_PRE_ADMIN_ONLY",
+      });
+    }
+
+    // LÓGICA DE TROCA DE PRODUTO COM AJUSTE DE ESTOQUE
+    // Se produtoId for passado e for diferente do produto atual, fazer swap
+    if (produtoId) {
+      const detalhesProdutos = Array.isArray(movimentacao.detalhesProdutos)
+        ? movimentacao.detalhesProdutos
+        : [];
+      const detalheAtual = detalhesProdutos[0]; // Primeiro produto abastecido
+
+      if (
+        detalheAtual &&
+        Number(detalheAtual.produtoId) !== Number(produtoId)
+      ) {
+        // Devolver quantidade anterior do produto antigo
+        const quantidadeAntiga = Number(detalheAtual.quantidadeAbastecida || 0);
+
+        const maquinaMovimentacao = await Maquina.findByPk(
+          movimentacao.maquinaId,
+          {
+            attributes: ["id", "lojaId"],
+            transaction,
+          },
+        );
+
+        // Desfazer o debit do produto antigo
+        const estoqueUsuarioAntigo = await EstoqueUsuario.findOne({
+          where: {
+            usuarioId: movimentacao.usuarioId,
+            produtoId: detalheAtual.produtoId,
+          },
+          transaction,
+        });
+
+        if (estoqueUsuarioAntigo) {
+          const saldoAtual = Number(estoqueUsuarioAntigo.quantidade || 0);
+          await estoqueUsuarioAntigo.update(
+            { quantidade: saldoAtual + quantidadeAntiga },
+            { transaction },
+          );
+        } else if (maquinaMovimentacao?.lojaId) {
+          const estoqueLojaAntigo = await EstoqueLoja.findOne({
+            where: {
+              lojaId: maquinaMovimentacao.lojaId,
+              produtoId: detalheAtual.produtoId,
+            },
+            transaction,
+          });
+
+          if (estoqueLojaAntigo) {
+            const saldoAtual = Number(estoqueLojaAntigo.quantidade || 0);
+            await estoqueLojaAntigo.update(
+              { quantidade: saldoAtual + quantidadeAntiga },
+              { transaction },
+            );
+          }
+        }
+
+        // Descontar quantidade do novo produto
+        const quantidadeNova = Number(abastecidas || 0);
+
+        if (quantidadeNova > 0) {
+          const estoqueUsuarioNovo = await EstoqueUsuario.findOne({
+            where: {
+              usuarioId: movimentacao.usuarioId,
+              produtoId: produtoId,
+            },
+            transaction,
+          });
+
+          if (estoqueUsuarioNovo) {
+            const saldoAtual = Number(estoqueUsuarioNovo.quantidade || 0);
+            const novoSaldo = saldoAtual - quantidadeNova;
+
+            if (novoSaldo < 0) {
+              await transaction.rollback();
+              return res.status(400).json({
+                error:
+                  "Estoque do funcionário insuficiente para o novo produto.",
+              });
+            }
+
+            await estoqueUsuarioNovo.update(
+              { quantidade: novoSaldo },
+              { transaction },
+            );
+          } else if (maquinaMovimentacao?.lojaId) {
+            const estoqueLojaNovoItem = await EstoqueLoja.findOne({
+              where: {
+                lojaId: maquinaMovimentacao.lojaId,
+                produtoId: produtoId,
+              },
+              transaction,
+            });
+
+            if (estoqueLojaNovoItem) {
+              const saldoAtual = Number(estoqueLojaNovoItem.quantidade || 0);
+              const novoSaldo = saldoAtual - quantidadeNova;
+
+              if (novoSaldo < 0) {
+                await transaction.rollback();
+                return res.status(400).json({
+                  error: "Estoque da loja insuficiente para o novo produto.",
+                });
+              }
+
+              await estoqueLojaNovoItem.update(
+                { quantidade: novoSaldo },
+                { transaction },
+              );
+            } else {
+              await transaction.rollback();
+              return res.status(400).json({
+                error: "Novo produto não tem estoque na loja.",
+              });
+            }
+          }
+        }
+
+        // Atualizar ou criar entrada em MovimentacaoProduto
+        if (detalheAtual) {
+          await detalheAtual.update(
+            {
+              produtoId: produtoId,
+              quantidadeAbastecida: quantidadeNova,
+            },
+            { transaction },
+          );
+        } else {
+          await MovimentacaoProduto.create(
+            {
+              movimentacaoId: movimentacao.id,
+              produtoId: produtoId,
+              quantidadeAbastecida: quantidadeNova,
+            },
+            { transaction },
+          );
+        }
+      }
+    }
+
+    const normalizarContadorAtualizacao = (valor, nomeCampo) => {
+      if (valor === undefined) return undefined;
+      if (valor === null || valor === "") return null;
+
+      const numero = Number(valor);
+      if (!Number.isInteger(numero) || numero < 0) {
+        const erro = new Error(
+          `O contador ${nomeCampo} deve ser um número inteiro não negativo.`,
+        );
+        erro.status = 400;
+        throw erro;
+      }
+
+      return numero;
+    };
+
+    let contadorInAtualizado;
+    let contadorOutAtualizado;
+    try {
+      contadorInAtualizado = normalizarContadorAtualizacao(contadorIn, "IN");
+      contadorOutAtualizado = normalizarContadorAtualizacao(contadorOut, "OUT");
+    } catch (error) {
+      await transaction.rollback();
+      transaction = null;
+      return res.status(error.status || 400).json({ error: error.message });
+    }
+
+    // Preparar dados para atualização
+    const updateData = {
+      observacoes: observacoes ?? movimentacao.observacoes,
+      tipoOcorrencia: tipoOcorrencia ?? movimentacao.tipoOcorrencia,
+      fichas:
+        fichas !== undefined ? parseInt(fichas) || 0 : movimentacao.fichas,
+      totalPre:
+        totalPre !== undefined
+          ? parseInt(totalPre) || 0
+          : movimentacao.totalPre,
+      sairam:
+        sairam !== undefined ? parseInt(sairam) || 0 : movimentacao.sairam,
+      abastecidas:
+        abastecidas !== undefined
+          ? parseInt(abastecidas) || 0
+          : movimentacao.abastecidas,
+      contadorIn:
+        contadorIn !== undefined
+          ? contadorInAtualizado
+          : movimentacao.contadorIn,
+      contadorOut:
+        contadorOut !== undefined
+          ? contadorOutAtualizado
+          : movimentacao.contadorOut,
+      contadorMaquina:
+        contadorMaquina !== undefined
+          ? parseInt(contadorMaquina) || null
+          : movimentacao.contadorMaquina,
+      quantidade_notas_entrada:
+        quantidade_notas_entrada !== undefined
+          ? parseFloat(quantidade_notas_entrada) || null
+          : movimentacao.quantidade_notas_entrada,
+      valor_entrada_maquininha_pix:
+        valor_entrada_maquininha_pix !== undefined
+          ? parseFloat(valor_entrada_maquininha_pix) || null
+          : movimentacao.valor_entrada_maquininha_pix,
+      dataColeta:
+        dataColeta !== undefined
+          ? (parseDataColetaUsuario(dataColeta) ?? movimentacao.dataColeta)
+          : movimentacao.dataColeta,
+    };
+
+    // Fórmula do negócio: totalPos = totalPre + abastecidas
+    updateData.totalPos = updateData.totalPre + updateData.abastecidas;
+
+    const abastecidasAnteriores = Number(movimentacao.abastecidas || 0);
+    const abastecidasNovas = Number(updateData.abastecidas || 0);
+    const deltaAbastecidas = abastecidasNovas - abastecidasAnteriores;
+
+    if (abastecidas !== undefined && deltaAbastecidas !== 0) {
+      const detalhesProdutos = Array.isArray(movimentacao.detalhesProdutos)
+        ? movimentacao.detalhesProdutos
+        : [];
+      const detalheAlvo =
+        detalhesProdutos.find(
+          (item) => Number(item?.quantidadeAbastecida || 0) > 0,
+        ) || detalhesProdutos[0];
+
+      if (detalheAlvo?.produtoId) {
+        const quantidadeDetalheAtual = Number(
+          detalheAlvo.quantidadeAbastecida || 0,
+        );
+        const quantidadeDetalheNova = quantidadeDetalheAtual + deltaAbastecidas;
+
+        if (quantidadeDetalheNova < 0) {
+          await transaction.rollback();
+          return res.status(400).json({
+            error:
+              "Quantidade abastecida inválida para o produto da movimentação.",
+          });
+        }
+
+        await detalheAlvo.update(
+          { quantidadeAbastecida: quantidadeDetalheNova },
+          { transaction },
+        );
+
+        const maquinaMovimentacao = await Maquina.findByPk(
+          movimentacao.maquinaId,
+          {
+            attributes: ["id", "lojaId"],
+            transaction,
+          },
+        );
+
+        const estoqueUsuario = await EstoqueUsuario.findOne({
+          where: {
+            usuarioId: movimentacao.usuarioId,
+            produtoId: detalheAlvo.produtoId,
+          },
+          transaction,
+        });
+
+        if (estoqueUsuario) {
+          const saldoAtual = Number(estoqueUsuario.quantidade || 0);
+          const novoSaldo = saldoAtual - deltaAbastecidas;
+
+          if (novoSaldo < 0) {
+            await transaction.rollback();
+            return res.status(400).json({
+              error:
+                "Estoque do funcionário insuficiente para aumentar o abastecimento.",
+            });
+          }
+
+          await estoqueUsuario.update(
+            { quantidade: novoSaldo },
+            { transaction },
+          );
+        } else if (maquinaMovimentacao?.lojaId) {
+          const estoqueLoja = await EstoqueLoja.findOne({
+            where: {
+              lojaId: maquinaMovimentacao.lojaId,
+              produtoId: detalheAlvo.produtoId,
+            },
+            transaction,
+          });
+
+          if (!estoqueLoja) {
+            if (deltaAbastecidas < 0) {
+              await EstoqueUsuario.create(
+                {
+                  usuarioId: movimentacao.usuarioId,
+                  produtoId: detalheAlvo.produtoId,
+                  quantidade: Math.abs(deltaAbastecidas),
+                },
+                { transaction },
+              );
+            } else {
+              await transaction.rollback();
+              return res.status(400).json({
+                error:
+                  "Não foi possível ajustar estoque: nenhum saldo de origem encontrado para o produto.",
+              });
+            }
+          } else {
+            const saldoAtual = Number(estoqueLoja.quantidade || 0);
+            const novoSaldo = saldoAtual - deltaAbastecidas;
+
+            if (novoSaldo < 0) {
+              await transaction.rollback();
+              return res.status(400).json({
+                error:
+                  "Estoque da loja insuficiente para aumentar o abastecimento.",
+              });
+            }
+
+            await estoqueLoja.update(
+              { quantidade: novoSaldo },
+              { transaction },
+            );
+          }
+        }
+      }
+    }
+
+    // Se sairam > 0, recalcular média fichas/prêmio
+    if (updateData.sairam > 0) {
+      updateData.mediaFichasPremio = (
+        updateData.fichas / updateData.sairam
+      ).toFixed(2);
+    }
+
+    // Se fichas, notas ou digital foram atualizados, recalcular o valorFaturado
+    if (
+      fichas !== undefined ||
+      quantidade_notas_entrada !== undefined ||
+      valor_entrada_maquininha_pix !== undefined
+    ) {
+      const maquina = await Maquina.findByPk(movimentacao.maquinaId);
+      if (maquina) {
+        updateData.valorFaturado =
+          updateData.fichas * parseFloat(maquina.valorFicha) +
+          (updateData.quantidade_notas_entrada
+            ? parseFloat(updateData.quantidade_notas_entrada)
+            : 0) +
+          (updateData.valor_entrada_maquininha_pix
+            ? parseFloat(updateData.valor_entrada_maquininha_pix)
+            : 0);
+      }
+    }
+
+    await movimentacao.update(updateData, { transaction });
+
+    // Retornar movimentação atualizada com dados completos
+    const movimentacaoAtualizada = await Movimentacao.findByPk(req.params.id, {
+      include: [
+        {
+          model: Maquina,
+          as: "maquina",
+          attributes: ["id", "codigo", "nome", "lojaId"],
+        },
+        {
+          model: Usuario,
+          as: "usuario",
+          attributes: ["id", "nome", "email"],
+        },
+        {
+          model: MovimentacaoProduto,
+          as: "detalhesProdutos",
+          include: [
+            {
+              model: Produto,
+              as: "produto",
+              attributes: ["id", "nome"],
+            },
+          ],
+        },
+      ],
+      transaction,
+    });
+
+    await transaction.commit();
+    transaction = null;
+
+    res.json(movimentacaoAtualizada);
+  } catch (error) {
+    if (transaction) {
+      try {
+        await transaction.rollback();
+      } catch {
+        // Sem ação adicional.
+      }
+    }
+    console.error("Erro ao atualizar movimentação:", error);
+    res.status(500).json({ error: "Erro ao atualizar movimentação" });
+  }
+};
+
+// Registra somente produto e quantidade, preservando os contadores IN/OUT.
+export const registrarAbastecimentoExtra = async (req, res) => {
+  let transaction = null;
+  const contextoLog = {
+    evento: "abastecimento_extra",
+    usuarioId: req.usuario?.id || null,
+    perfil: req.usuario?.role || null,
+    movimentacaoId: req.params.id,
+    produtoId: req.body?.produtoId || null,
+    quantidade: req.body?.quantidadeAbastecida ?? null,
+    estoqueEncontrado: null,
+  };
+
+  const logRejeicao = (motivo, extras = {}) => {
+    console.warn("[abastecimento-extra] rejeitado", {
+      ...contextoLog,
+      ...extras,
+      motivo,
+    });
+  };
+
+  const rollback = async () => {
+    if (!transaction) return;
+    const transactionAtual = transaction;
+    transaction = null;
+    await transactionAtual.rollback();
+  };
+
+  const rejeitar = async (status, error, motivo, extras = {}) => {
+    await rollback();
+    logRejeicao(motivo, extras);
+    return res.status(status).json({ error });
+  };
+
+  try {
+    const { produtoId, quantidadeAbastecida } = req.body;
+    const quantidadeExtra = Number(quantidadeAbastecida);
+
+    console.info("[abastecimento-extra] solicitado", contextoLog);
+
+    if (!produtoId || !String(produtoId).trim()) {
+      logRejeicao("produtoId ausente");
+      return res.status(400).json({ error: "produtoId é obrigatório" });
+    }
+
+    if (!Number.isInteger(quantidadeExtra) || quantidadeExtra <= 0) {
+      logRejeicao("quantidade inválida");
+      return res.status(400).json({
+        error: "quantidadeAbastecida deve ser um número inteiro maior que zero",
+      });
+    }
+
+    transaction = await Movimentacao.sequelize.transaction();
+    const lock =
+      transaction.LOCK?.UPDATE !== undefined
+        ? { lock: transaction.LOCK.UPDATE }
+        : {};
+
+    const movimentacao = await Movimentacao.findByPk(req.params.id, {
+      transaction,
+      ...lock,
+    });
+
+    if (!movimentacao) {
+      return rejeitar(
+        404,
+        "Movimentação não encontrada",
+        "movimentação não encontrada",
+      );
+    }
+
+    const maquina = await Maquina.findByPk(movimentacao.maquinaId, {
+      attributes: ["id", "codigo", "nome", "lojaId", "tipo"],
+      transaction,
+    });
+
+    if (!maquina) {
+      return rejeitar(404, "Máquina não encontrada", "máquina não encontrada");
+    }
+
+    const produto = await Produto.findByPk(produtoId, {
+      attributes: ["id", "nome"],
+      transaction,
+    });
+
+    if (!produto) {
+      return rejeitar(404, "Produto não encontrado", "produto não encontrado");
+    }
+
+    const role = req.usuario?.role;
+    const isGestor = ["ADMIN", "GERENCIADOR"].includes(role);
+    const isFuncionario = [
+      "FUNCIONARIO",
+      "FUNCIONARIO_TODAS_LOJAS",
+      "ABASTECEDOR",
+    ].includes(role);
+
+    if (!isGestor && !isFuncionario) {
+      return rejeitar(
+        403,
+        "Usuário sem acesso para executar este roteiro",
+        "perfil não autorizado para executar roteiro",
+      );
+    }
+
+    let roteiro = null;
+    let usuarioResponsavelId = null;
+    if (movimentacao.roteiroId) {
+      roteiro = await Roteiro.findByPk(movimentacao.roteiroId, {
+        attributes: ["id", "funcionarioId"],
+        transaction,
+      });
+
+      if (!roteiro) {
+        return rejeitar(404, "Roteiro não encontrado", "roteiro não encontrado");
+      }
+
+      // O responsável "atual" é quem está com a execução semanal em andamento,
+      // não o funcionarioId estático do roteiro (que só muda se reenviado
+      // explicitamente e pode ficar apontando pra outra pessoa).
+      const contextoExecucao = await resolverContextoExecucaoSemanal(roteiro.id);
+      usuarioResponsavelId =
+        contextoExecucao.emAndamento && contextoExecucao.execucao?.usuarioId
+          ? contextoExecucao.execucao.usuarioId
+          : roteiro.funcionarioId;
+
+      const lojaNoRoteiro = await RoteiroLoja.findOne({
+        where: {
+          RoteiroId: roteiro.id,
+          LojaId: maquina.lojaId,
+        },
+        transaction,
+      });
+
+      if (!lojaNoRoteiro) {
+        return rejeitar(
+          403,
+          "A máquina não pertence a uma loja deste roteiro",
+          "loja da máquina não pertence ao roteiro",
+          { lojaId: maquina.lojaId, roteiroId: roteiro.id },
+        );
+      }
+    } else if (!isGestor) {
+      return rejeitar(
+        403,
+        "Movimentação sem roteiro acessível para este usuário",
+        "movimentação não vinculada a roteiro",
+      );
+    }
+
+    if (
+      !isGestor &&
+      String(usuarioResponsavelId || "") !== String(req.usuario.id)
+    ) {
+      return rejeitar(
+        403,
+        "Você não é o funcionário responsável por este roteiro",
+        "usuário não é o responsável pelo roteiro",
+        {
+          roteiroId: roteiro?.id || null,
+          usuarioResponsavelId: usuarioResponsavelId || null,
+        },
+      );
+    }
+
+    if (!isGestor && ["FUNCIONARIO", "ABASTECEDOR"].includes(role)) {
+      const permissaoLoja = await UsuarioLoja.findOne({
+        where: {
+          usuarioId: req.usuario.id,
+          lojaId: maquina.lojaId,
+        },
+        transaction,
+      });
+      const podeRegistrar =
+        permissaoLoja &&
+        permissaoLoja.permissoes?.registrarMovimentacao !== false;
+
+      if (!podeRegistrar) {
+        return rejeitar(
+          403,
+          "Usuário sem acesso para registrar movimentações nesta loja",
+          "usuário sem permissão na loja do roteiro",
+          { lojaId: maquina.lojaId, roteiroId: roteiro?.id || null },
+        );
+      }
+    }
+
+    const usuarioEstoqueId =
+      req.usuario?.id || usuarioResponsavelId || movimentacao.usuarioId;
+    const estoqueUsuario = await EstoqueUsuario.findOne({
+      where: {
+        usuarioId: usuarioEstoqueId,
+        produtoId,
+      },
+      transaction,
+      ...lock,
+    });
+
+    const estoqueLoja = estoqueUsuario
+      ? null
+      : await EstoqueLoja.findOne({
+          where: {
+            lojaId: maquina.lojaId,
+            produtoId,
+          },
+          transaction,
+          ...lock,
+        });
+    const estoqueOrigem = estoqueUsuario || estoqueLoja;
+    const origemEstoque = estoqueUsuario ? "usuario" : "loja";
+
+    if (!estoqueOrigem) {
+      return rejeitar(
+        404,
+        "Estoque não encontrado para o produto selecionado",
+        "estoque do usuário e da loja não encontrado",
+        {
+          usuarioEstoqueId,
+          lojaId: maquina.lojaId,
+        },
+      );
+    }
+
+    const saldoAtual = Number(estoqueOrigem.quantidade || 0);
+    contextoLog.estoqueEncontrado = {
+      id: estoqueOrigem.id,
+      origem: origemEstoque,
+      saldoAtual,
+      usuarioId: estoqueUsuario ? usuarioEstoqueId : null,
+      lojaId: estoqueLoja ? maquina.lojaId : null,
+    };
+    console.info("[abastecimento-extra] estoque encontrado", contextoLog);
+
+    if (saldoAtual < quantidadeExtra) {
+      return rejeitar(
+        409,
+        "Estoque insuficiente para o abastecimento extra",
+        "estoque insuficiente",
+        {
+          origemEstoque,
+          saldoDisponivel: saldoAtual,
+          quantidadeSolicitada: quantidadeExtra,
+        },
+      );
+    }
+
+    await estoqueOrigem.update(
+      { quantidade: saldoAtual - quantidadeExtra },
+      { transaction },
+    );
+
+    const detalheExistente = await MovimentacaoProduto.findOne({
+      where: {
+        movimentacaoId: movimentacao.id,
+        produtoId,
+      },
+      transaction,
+      ...lock,
+    });
+
+    if (detalheExistente) {
+      await detalheExistente.update(
+        {
+          quantidadeAbastecida:
+            Number(detalheExistente.quantidadeAbastecida || 0) +
+            quantidadeExtra,
+        },
+        { transaction },
+      );
+    } else {
+      await MovimentacaoProduto.create(
+        {
+          movimentacaoId: movimentacao.id,
+          produtoId,
+          quantidadeSaiu: 0,
+          quantidadeAbastecida: quantidadeExtra,
+          retiradaProduto: 0,
+        },
+        { transaction },
+      );
+    }
+
+    const abastecidasNovas =
+      Number(movimentacao.abastecidas || 0) + quantidadeExtra;
+
+    // O hook beforeSave do model recalcula totalPos = totalPre + abastecidas
+    // incondicionalmente (sobrescrevendo qualquer totalPos que passarmos aqui).
+    // Se o totalPos atual da movimentação já estiver fora dessa soma — por
+    // exemplo, após um ajuste manual de estoque feito com hooks:false em
+    // adminAjusteMaquinaController.js — recalcular a partir do totalPre antigo
+    // descartaria esse ajuste. Por isso derivamos um totalPre ajustado que
+    // preserva o totalPos atual e soma quantidadeExtra a partir dele.
+    const totalPosAtual = Number(movimentacao.totalPos || 0);
+    const totalPosNovo = totalPosAtual + quantidadeExtra;
+    const totalPreAjustado = totalPosNovo - abastecidasNovas;
+
+    await movimentacao.update(
+      {
+        totalPre: totalPreAjustado,
+        abastecidas: abastecidasNovas,
+        totalPos: totalPosNovo,
+        produtoNaMaquinaId: produtoId,
+      },
+      { transaction },
+    );
+
+    const movimentacaoAtualizada = await Movimentacao.findByPk(req.params.id, {
+      include: [
+        {
+          model: Maquina,
+          as: "maquina",
+          attributes: ["id", "codigo", "nome", "lojaId", "tipo"],
+        },
+        {
+          model: Usuario,
+          as: "usuario",
+          attributes: ["id", "nome", "email"],
+        },
+        {
+          model: MovimentacaoProduto,
+          as: "detalhesProdutos",
+          include: [
+            {
+              model: Produto,
+              as: "produto",
+              attributes: ["id", "nome"],
+            },
+          ],
+        },
+      ],
+      transaction,
+    });
+
+    await transaction.commit();
+    transaction = null;
+
+    console.info("[abastecimento-extra] concluído", {
+      ...contextoLog,
+      origemEstoque,
+      saldoFinal: saldoAtual - quantidadeExtra,
+    });
+
+    return res.status(200).json(movimentacaoAtualizada);
+  } catch (error) {
+    if (transaction) {
+      try {
+        await rollback();
+      } catch {
+        // O erro original é o mais relevante para o diagnóstico.
+      }
+    }
+    console.error("[abastecimento-extra] erro interno", {
+      ...contextoLog,
+      motivo: error?.message || String(error),
+      stack: error?.stack,
+    });
+    return res.status(500).json({
+      error: "Erro interno ao registrar abastecimento",
+    });
+  }
+};
+
+// Deletar movimentação (apenas ADMIN)
+export const deletarMovimentacao = async (req, res) => {
+  try {
+    const movimentacao = await Movimentacao.findByPk(req.params.id);
+
+    if (!movimentacao) {
+      return res.status(404).json({ error: "Movimentação não encontrada" });
+    }
+
+    await movimentacao.destroy();
+
+    res.json({ message: "Movimentação deletada com sucesso" });
+  } catch (error) {
+    console.error("Erro ao deletar movimentação:", error);
+    res.status(500).json({ error: "Erro ao deletar movimentação" });
+  }
+};
+
+// GET /relatorios/alertas-abastecimento-incompleto?lojaId=...&dataInicio=...&dataFim=...
+export const alertasAbastecimentoIncompleto = async (req, res) => {
+  try {
+    const { lojaId, dataInicio, dataFim, maquinaId } = req.query;
+    const { Movimentacao, Maquina, Usuario, AlertaIgnorado } =
+      await import("../models/index.js");
+
+    const usuarioId = req.usuario?.id;
+
+    // Busca movimentações no período, loja e máquina
+    const whereMov = {};
+    if (dataInicio || dataFim) {
+      whereMov.dataColeta = {};
+      if (dataInicio) whereMov.dataColeta[Op.gte] = new Date(dataInicio);
+      if (dataFim) whereMov.dataColeta[Op.lte] = new Date(dataFim);
+    }
+    if (maquinaId) {
+      whereMov.maquinaId = maquinaId;
+    }
+
+    const include = [
+      {
+        model: Maquina,
+        as: "maquina",
+        attributes: ["id", "nome", "capacidadePadrao", "lojaId"],
+        ...(lojaId ? { where: { lojaId } } : {}),
+      },
+      {
+        model: Usuario,
+        as: "usuario",
+        attributes: ["id", "nome"],
+      },
+    ];
+
+    // Busca movimentações com abastecimento
+    const movimentacoes = await Movimentacao.findAll({
+      where: whereMov,
+      include,
+      order: [["dataColeta", "DESC"]],
+    });
+
+    // Buscar alertas ignorados globalmente
+    const ignorados = await AlertaIgnorado.findAll();
+    const ignoradosSet = new Set(ignorados.map((a) => a.alertaId));
+
+    // Gera alertas para abastecimento incompleto
+    const alertas = movimentacoes
+      .filter((mov) => {
+        const alertaId = `abastecimento-${mov.maquina.id}-${mov.id}`;
+        // Só alerta se houve abastecimento e o totalDepois é diferente do padrão
+        // e se não foi ignorado pelo usuário
+        if (
+          mov.abastecidas > 0 &&
+          mov.totalPre + mov.abastecidas !== mov.maquina.capacidadePadrao &&
+          !ignoradosSet.has(alertaId)
+        ) {
+          return true;
+        }
+        return false;
+      })
+      .map((mov) => ({
+        id: `abastecimento-${mov.maquina.id}-${mov.id}`,
+        tipo: "abastecimento_incompleto",
+        maquinaId: mov.maquina.id,
+        maquinaNome: mov.maquina.nome,
+        capacidadePadrao: mov.maquina.capacidadePadrao,
+        totalAntes: mov.totalPre,
+        abastecido: mov.abastecidas,
+        totalDepois: mov.totalPre + mov.abastecidas,
+        usuario: mov.usuario?.nome,
+        dataMovimentacao: mov.dataColeta,
+        observacao: mov.observacoes || "Sem observação",
+        mensagem: `Abastecimento incompleto: padrão ${
+          mov.maquina.capacidadePadrao
+        }, tinha ${mov.totalPre}, abasteceu ${mov.abastecidas}, ficou com ${
+          mov.totalPre + mov.abastecidas
+        }. Motivo: ${mov.observacoes || "Não informado"}`,
+      }));
+
+    res.json({ alertas });
+  } catch (error) {
+    console.error("Erro ao buscar alertas de abastecimento incompleto:", error);
+    res
+      .status(500)
+      .json({ error: "Erro ao buscar alertas de abastecimento incompleto" });
+  }
+};
+
+// GET /maquinas/:id/problema
+export const problemaMaquina = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const maquina = await Maquina.findByPk(id);
+    if (!maquina) {
+      return res.status(404).json({ error: "Máquina não encontrada" });
+    }
+    // Busca última movimentação
+    const ultimaMov = await Movimentacao.findOne({
+      where: { maquinaId: id },
+      order: [["dataColeta", "DESC"]],
+    });
+    const problemas = [];
+    // Buscar alerta de inconsistência de IN/OUT (igual rota de alertas)
+    const movimentacoes = await Movimentacao.findAll({
+      where: { maquinaId: id },
+      order: [["dataColeta", "DESC"]],
+      limit: 2,
+      attributes: [
+        "id",
+        "contadorIn",
+        "contadorOut",
+        "fichas",
+        "sairam",
+        "dataColeta",
+      ],
+    });
+    if (movimentacoes.length === 2) {
+      const atual = movimentacoes[0];
+      const anterior = movimentacoes[1];
+      const diffOut = (atual.contadorOut || 0) - (anterior.contadorOut || 0);
+      const diffIn = (atual.contadorIn || 0) - (anterior.contadorIn || 0);
+      if (
+        (diffOut !== (atual.sairam || 0) || diffIn !== (atual.fichas || 0)) &&
+        !(atual.contadorOut === 0 && atual.contadorIn === 0)
+      ) {
+        problemas.push({
+          tipo: "inconsistencia_contador",
+          mensagem: `Inconsistência detectada: OUT (${diffOut}) esperado ${
+            atual.sairam
+          }, IN (${diffIn}) esperado ${atual.fichas}. OUT registrado: ${
+            atual.contadorOut || 0
+          } | IN registrado: ${atual.contadorIn || 0} | Fichas: ${
+            atual.fichas
+          }`,
+          data: atual.dataColeta,
+        });
+      }
+    }
+    // Regra: abastecimento incompleto
+    if (
+      ultimaMov &&
+      typeof ultimaMov.abastecidas === "number" &&
+      typeof ultimaMov.totalPre === "number" &&
+      ultimaMov.abastecidas > 0 &&
+      ultimaMov.totalPre + ultimaMov.abastecidas !== maquina.capacidadePadrao
+    ) {
+      problemas.push({
+        tipo: "abastecimento",
+        mensagem: `Abastecimento incompleto: padrão ${
+          maquina.capacidadePadrao
+        }, tinha ${ultimaMov.totalPre}, abasteceu ${
+          ultimaMov.abastecidas
+        }, ficou com ${ultimaMov.totalPre + ultimaMov.abastecidas}. Motivo: ${
+          ultimaMov.observacoes || "Não informado"
+        }`,
+        data: ultimaMov.dataColeta,
+      });
+    }
+    res.json({
+      maquina: {
+        id: maquina.id,
+        nome: maquina.nome,
+        capacidadePadrao: maquina.capacidadePadrao,
+      },
+      problemas,
+    });
+  } catch (error) {
+    console.error("Erro ao buscar problema da máquina:", error);
+    res.status(500).json({ error: "Erro ao buscar problema da máquina" });
+  }
+};
+
+// Relatório de movimentações do dia
+export const relatorioMovimentacoesDia = async (req, res) => {
+  try {
+    const { data, lojaId } = req.query;
+    const targetDate = data ? new Date(data) : new Date();
+    const startOfDay = new Date(targetDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(targetDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const whereMovimentacao = {
+      dataColeta: { [Op.between]: [startOfDay, endOfDay] },
+      retiradaEstoque: false,
+    };
+
+    const whereMaquina = {};
+    if (lojaId) whereMaquina.lojaId = lojaId;
+
+    const movimentacoes = await Movimentacao.findAll({
+      where: whereMovimentacao,
+      include: [
+        {
+          model: Maquina,
+          as: "maquina",
+          where: Object.keys(whereMaquina).length ? whereMaquina : undefined,
+          include: [{ model: Loja, as: "loja", attributes: ["id", "nome"] }],
+          attributes: { include: ["valorFicha"] },
+        },
+        { model: Usuario, as: "usuario", attributes: ["id", "nome"] },
+      ],
+      order: [["dataColeta", "DESC"]],
+    });
+
+    const totalFaturado = movimentacoes.reduce((acc, m) => {
+      const fqtd = parseInt(m.fichas) || 0;
+      const vf = parseFloat(m.maquina?.valorFicha || 0);
+      const fat =
+        fqtd * vf +
+        parseFloat(m.quantidade_notas_entrada || 0) +
+        parseFloat(m.valor_entrada_maquininha_pix || 0);
+      return acc + fat;
+    }, 0);
+    const totalFichas = movimentacoes.reduce(
+      (acc, m) => acc + (m.fichas || 0),
+      0,
+    );
+    const totalSairam = movimentacoes.reduce(
+      (acc, m) => acc + (m.sairam || 0),
+      0,
+    );
+
+    res.json({
+      data: targetDate.toISOString().split("T")[0],
+      totalMovimentacoes: movimentacoes.length,
+      totalFaturado,
+      totalFichas,
+      totalSairam,
+      movimentacoes,
+    });
+  } catch (error) {
+    console.error("Erro no relatório de movimentações do dia:", error);
+    res
+      .status(500)
+      .json({ error: "Erro ao gerar relatório de movimentações do dia" });
+  }
+};
+
+// Relatório de lucro total do dia
+// Receita bruta = (fichas × valorFicha) + dinheiro (notas) + pix/cartão
+// Custo produtos = Σ(quantidadeSaiu × custoUnitario)
+// Comissão = Σ(receita_maquina × comissaoLojaPercentual / 100)
+// Lucro líquido = receita bruta − custo produtos − comissão − custos fixos − custos variáveis
+export const relatorioLucroTotalDia = async (req, res) => {
+  try {
+    const { data, lojaId } = req.query;
+    if (!lojaId) {
+      return res.status(400).json({ error: "Parâmetro lojaId é obrigatório" });
+    }
+    const targetDate = data ? new Date(data) : new Date();
+    const startOfDay = new Date(targetDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(targetDate);
+    endOfDay.setHours(23, 59, 59, 999);
+    const dataISO = targetDate.toISOString().split("T")[0];
+
+    const whereMovimentacao = {
+      dataColeta: { [Op.between]: [startOfDay, endOfDay] },
+      retiradaEstoque: false,
+    };
+    const whereMaquina = { lojaId };
+
+    // 1) Buscar movimentações do dia com dados da máquina
+    // NÃO usar raw:true para garantir nomes corretos de atributos com field: mapping
+    const movimentacoesRaw = await Movimentacao.findAll({
+      where: whereMovimentacao,
+      include: [
+        {
+          model: Maquina,
+          as: "maquina",
+          where: whereMaquina,
+          attributes: ["id", "nome", "valorFicha", "comissaoLojaPercentual"],
+        },
+      ],
+    });
+    const movimentacoes = movimentacoesRaw.map((m) => m.toJSON());
+
+    console.log(
+      `[RELATORIO LUCRO] ${movimentacoes.length} movimentações encontradas para loja ${lojaId} em ${dataISO}`,
+    );
+    if (movimentacoes.length > 0) {
+      console.log("[RELATORIO LUCRO] Exemplo mov[0]:", {
+        fichas: movimentacoes[0].fichas,
+        quantidade_notas_entrada: movimentacoes[0].quantidade_notas_entrada,
+        valor_entrada_maquininha_pix:
+          movimentacoes[0].valor_entrada_maquininha_pix,
+        maquina_valorFicha: movimentacoes[0].maquina?.valorFicha,
+        maquina_comissao: movimentacoes[0].maquina?.comissaoLojaPercentual,
+      });
+    }
+
+    // 2) Calcular receita bruta por movimentação
+    let totalFichasValor = 0;
+    let totalDinheiro = 0;
+    let totalPix = 0;
+    let comissaoTotal = 0;
+    let totalFichasQtd = 0;
+
+    for (const m of movimentacoes) {
+      const fichas = parseInt(m.fichas) || 0;
+      const valorFicha = parseFloat(m.maquina?.valorFicha || 0);
+      const fichasValor = fichas * valorFicha;
+      const dinheiro = parseFloat(m.quantidade_notas_entrada || 0);
+      const pix = parseFloat(m.valor_entrada_maquininha_pix || 0);
+      const receitaMaquina = fichasValor + dinheiro + pix;
+
+      totalFichasQtd += fichas;
+      totalFichasValor += fichasValor;
+      totalDinheiro += dinheiro;
+      totalPix += pix;
+
+      // Comissão da loja por máquina
+      const percentual = parseFloat(m.maquina?.comissaoLojaPercentual || 0);
+      comissaoTotal += (receitaMaquina * percentual) / 100;
+    }
+
+    const receitaBruta = totalFichasValor + totalDinheiro + totalPix;
+
+    console.log("[RELATORIO LUCRO] Totais calculados:", {
+      receitaBruta,
+      totalFichasValor,
+      totalDinheiro,
+      totalPix,
+      comissaoTotal,
+    });
+
+    // 3) Custo dos produtos que saíram
+    const itensVendidosRaw = await MovimentacaoProduto.findAll({
+      attributes: ["quantidadeSaiu"],
+      include: [
+        { model: Produto, as: "produto", attributes: ["custoUnitario"] },
+        {
+          model: Movimentacao,
+          attributes: [],
+          where: whereMovimentacao,
+          include: [
+            {
+              model: Maquina,
+              as: "maquina",
+              where: whereMaquina,
+              attributes: [],
+            },
+          ],
+        },
+      ],
+    });
+    const itensVendidos = itensVendidosRaw.map((i) => i.toJSON());
+
+    const custoProdutos = itensVendidos.reduce((acc, item) => {
+      const qtd = parseInt(item.quantidadeSaiu) || 0;
+      const custo = parseFloat(item.produto?.custoUnitario || 0);
+      return acc + qtd * custo;
+    }, 0);
+
+    // 4) Custos fixos e variáveis do financeiro (contas_financeiro) para o dia/loja
+    let custosFixos = 0;
+    let custosVariaveis = 0;
+    try {
+      const loja = await Loja.findByPk(lojaId, { attributes: ["nome"] });
+      if (loja) {
+        const contasDoDia = await ContasFinanceiro.findAll({
+          where: {
+            due_date: dataISO,
+            city: loja.nome,
+            status: { [Op.ne]: "paid" },
+          },
+          raw: true,
+        });
+        for (const conta of contasDoDia) {
+          const valor = parseFloat(conta.value || 0);
+          const tipo = (conta.bill_type || "").toLowerCase();
+          if (tipo.includes("fixo") || tipo === "fixed") {
+            custosFixos += valor;
+          } else {
+            custosVariaveis += valor;
+          }
+        }
+      }
+    } catch (finErr) {
+      console.warn("⚠️ Erro ao buscar custos financeiros:", finErr.message);
+    }
+
+    // 5) Lucro líquido = receita - produtos - comissão - custos
+    const lucroTotal =
+      receitaBruta -
+      custoProdutos -
+      comissaoTotal -
+      custosFixos -
+      custosVariaveis;
+
+    res.json({
+      lojaId,
+      data: dataISO,
+      receitaBruta: parseFloat(receitaBruta.toFixed(2)),
+      detalhesReceita: {
+        fichasQuantidade: totalFichasQtd,
+        fichasValor: parseFloat(totalFichasValor.toFixed(2)),
+        dinheiro: parseFloat(totalDinheiro.toFixed(2)),
+        pixCartao: parseFloat(totalPix.toFixed(2)),
+      },
+      custoProdutos: parseFloat(custoProdutos.toFixed(2)),
+      comissaoTotal: parseFloat(comissaoTotal.toFixed(2)),
+      custosFixos: parseFloat(custosFixos.toFixed(2)),
+      custosVariaveis: parseFloat(custosVariaveis.toFixed(2)),
+      lucroTotal: parseFloat(lucroTotal.toFixed(2)),
+    });
+  } catch (error) {
+    console.error("Erro no relatório de lucro do dia:", error);
+    res.status(500).json({ error: "Erro ao gerar relatório de lucro do dia" });
+  }
+};
+
+// Relatório de comissão total do dia
+// Comissão = receita_por_maquina × comissaoLojaPercentual / 100
+// Receita por máquina = (fichas × valorFicha) + dinheiro + pix
+export const relatorioComissaoTotalDia = async (req, res) => {
+  try {
+    const { data, lojaId } = req.query;
+    if (!lojaId) {
+      return res.status(400).json({ error: "Parâmetro lojaId é obrigatório" });
+    }
+    const targetDate = data ? new Date(data) : new Date();
+    const startOfDay = new Date(targetDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(targetDate);
+    endOfDay.setHours(23, 59, 59, 999);
+    const dataISO = targetDate.toISOString().split("T")[0];
+
+    const whereMovimentacao = {
+      dataColeta: { [Op.between]: [startOfDay, endOfDay] },
+      retiradaEstoque: false,
+    };
+    const whereMaquina = { lojaId };
+
+    // NÃO usar raw:true para garantir nomes corretos (comissaoLojaPercentual vs comissao_loja_percentual)
+    const movimentacoesRaw = await Movimentacao.findAll({
+      where: whereMovimentacao,
+      include: [
+        {
+          model: Maquina,
+          as: "maquina",
+          where: whereMaquina,
+          attributes: ["id", "nome", "valorFicha", "comissaoLojaPercentual"],
+        },
+      ],
+    });
+    const movimentacoes = movimentacoesRaw.map((m) => m.toJSON());
+
+    console.log(
+      `[RELATORIO COMISSAO] ${movimentacoes.length} movimentações encontradas para loja ${lojaId} em ${dataISO}`,
+    );
+    if (movimentacoes.length > 0) {
+      console.log("[RELATORIO COMISSAO] Exemplo mov[0]:", {
+        fichas: movimentacoes[0].fichas,
+        quantidade_notas_entrada: movimentacoes[0].quantidade_notas_entrada,
+        valor_entrada_maquininha_pix:
+          movimentacoes[0].valor_entrada_maquininha_pix,
+        maquina_valorFicha: movimentacoes[0].maquina?.valorFicha,
+        maquina_comissao: movimentacoes[0].maquina?.comissaoLojaPercentual,
+        maquina_nome: movimentacoes[0].maquina?.nome,
+      });
+    }
+
+    let comissaoTotal = 0;
+    const comissaoPorMaquina = {};
+
+    for (const m of movimentacoes) {
+      const fichas = parseInt(m.fichas) || 0;
+      const valorFicha = parseFloat(m.maquina?.valorFicha || 0);
+      const fichasValor = fichas * valorFicha;
+      const dinheiro = parseFloat(m.quantidade_notas_entrada || 0);
+      const pix = parseFloat(m.valor_entrada_maquininha_pix || 0);
+      const receitaMaquina = fichasValor + dinheiro + pix;
+
+      const percentual = parseFloat(m.maquina?.comissaoLojaPercentual || 0);
+      const comissao = (receitaMaquina * percentual) / 100;
+      comissaoTotal += comissao;
+
+      console.log(
+        `[RELATORIO COMISSAO] Máquina ${m.maquina?.nome}: fichas=${fichas} x R$${valorFicha} = R$${fichasValor}, dinheiro=R$${dinheiro}, pix=R$${pix}, receita=R$${receitaMaquina}, comissao=${percentual}% = R$${comissao.toFixed(2)}`,
+      );
+
+      const maqId = m.maquina?.id;
+      if (maqId) {
+        if (!comissaoPorMaquina[maqId]) {
+          comissaoPorMaquina[maqId] = {
+            maquinaId: maqId,
+            maquinaNome: m.maquina?.nome || "Desconhecida",
+            percentualComissao: percentual,
+            receitaTotal: 0,
+            comissaoTotal: 0,
+          };
+        }
+        comissaoPorMaquina[maqId].receitaTotal += receitaMaquina;
+        comissaoPorMaquina[maqId].comissaoTotal += comissao;
+      }
+    }
+
+    const detalhesPorMaquina = Object.values(comissaoPorMaquina).map((d) => ({
+      ...d,
+      receitaTotal: parseFloat(d.receitaTotal.toFixed(2)),
+      comissaoTotal: parseFloat(d.comissaoTotal.toFixed(2)),
+    }));
+
+    console.log(
+      `[RELATORIO COMISSAO] Total comissão: R$${comissaoTotal.toFixed(2)}, Máquinas: ${detalhesPorMaquina.length}`,
+    );
+
+    res.json({
+      lojaId,
+      data: dataISO,
+      comissaoTotal: parseFloat(comissaoTotal.toFixed(2)),
+      detalhesPorMaquina,
+    });
+  } catch (error) {
+    console.error("Erro no relatório de comissão do dia:", error);
+    res
+      .status(500)
+      .json({ error: "Erro ao gerar relatório de comissão do dia" });
+  }
+};
