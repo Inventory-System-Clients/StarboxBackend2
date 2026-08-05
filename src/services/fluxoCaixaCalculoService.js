@@ -292,3 +292,58 @@ export const calcularEsperadoMovimentacaoRetirada = async ({
     permitirFallbackDeltaOut,
   });
 };
+
+const ATRIBUTOS_HISTORICO_MOVIMENTACAO = [
+  "id",
+  "maquinaId",
+  "dataColeta",
+  "createdAt",
+  "contadorIn",
+  "contadorInDigital",
+  "contadorOut",
+  "contadorOutDigital",
+  "contadorInAnterior",
+  "contadorOutAnterior",
+];
+
+// Calcula o valor esperado de retirada para várias movimentações de uma vez,
+// buscando o histórico de todas as máquinas envolvidas em uma única query
+// (em vez de 1 Movimentacao.findAll por item, que esgotava o pool de conexões
+// quando havia muitos registros — ex.: fluxo de caixa sem filtro de loja).
+export const calcularEsperadoParaVariasMovimentacoes = async (
+  movimentacoesAtuais,
+) => {
+  const idsMaquinasUnicos = [
+    ...new Set(
+      (movimentacoesAtuais || [])
+        .map((mov) => normalizarMovimentacao(mov || {}).maquinaId)
+        .filter(Boolean),
+    ),
+  ];
+
+  const historicoPorMaquina = new Map();
+  if (idsMaquinasUnicos.length > 0) {
+    const historicoCompleto = await Movimentacao.findAll({
+      where: { maquinaId: idsMaquinasUnicos },
+      attributes: ATRIBUTOS_HISTORICO_MOVIMENTACAO,
+    });
+
+    for (const item of historicoCompleto) {
+      const maquinaId = normalizarMovimentacao(item).maquinaId;
+      if (!historicoPorMaquina.has(maquinaId)) {
+        historicoPorMaquina.set(maquinaId, []);
+      }
+      historicoPorMaquina.get(maquinaId).push(item);
+    }
+  }
+
+  return (movimentacoesAtuais || []).map((movimentacaoAtual) => {
+    const atual = normalizarMovimentacao(movimentacaoAtual || {});
+    return calcularEsperadoComHistorico({
+      movimentacaoAtual: atual,
+      historicoMovimentacoes: historicoPorMaquina.get(atual.maquinaId) || [],
+      valorFicha: decimalOuNull(atual.maquina?.valorFicha),
+      permitirFallbackDeltaOut: false,
+    });
+  });
+};

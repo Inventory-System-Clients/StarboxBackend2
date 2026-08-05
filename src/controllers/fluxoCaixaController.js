@@ -6,7 +6,10 @@ import {
   Usuario,
 } from "../models/index.js";
 import { Op, literal } from "sequelize";
-import { calcularEsperadoMovimentacaoRetirada } from "../services/fluxoCaixaCalculoService.js";
+import {
+  calcularEsperadoMovimentacaoRetirada,
+  calcularEsperadoParaVariasMovimentacoes,
+} from "../services/fluxoCaixaCalculoService.js";
 
 const possuiNumero = (valor) =>
   valor !== null &&
@@ -101,6 +104,33 @@ const enriquecerFluxoComCalculo = async (fluxoInstance) => {
     deltaContadorOut: calculo.deltaContadorOut,
     algoritmoValorEsperado: calculo.algoritmoValorEsperado,
   };
+};
+
+// Mesma coisa que enriquecerFluxoComCalculo, mas para uma lista inteira de
+// uma vez: busca o histórico de todas as máquinas envolvidas em 1 única
+// query, em vez de 1 Movimentacao.findAll por fluxo (que, sem filtro de
+// loja, chegava a centenas de queries concorrentes e esgotava o pool).
+const enriquecerFluxosEmLote = async (fluxoInstances) => {
+  const fluxosJson = fluxoInstances.map((f) => f.toJSON());
+  const calculos = await calcularEsperadoParaVariasMovimentacoes(
+    fluxosJson.map((f) => f.movimentacao),
+  );
+
+  return fluxosJson.map((fluxo, index) => {
+    const calculo = calculos[index];
+    const valorRetiradoTotal = calcularValorRetiradoTotal(fluxo);
+
+    return {
+      ...fluxo,
+      valorRetiradoTotal,
+      valorEsperadoCalculado: calculo.valorEsperadoCalculado,
+      ultimoContadorInRetirada: calculo.ultimoContadorInRetirada,
+      ultimoContadorOutRetirada: calculo.ultimoContadorOutRetirada,
+      deltaContadorIn: calculo.deltaContadorIn,
+      deltaContadorOut: calculo.deltaContadorOut,
+      algoritmoValorEsperado: calculo.algoritmoValorEsperado,
+    };
+  });
 };
 
 // Listar todos os registros de fluxo de caixa (apenas movimentações marcadas como retirada de dinheiro)
@@ -204,9 +234,7 @@ export const listarFluxoCaixa = async (req, res) => {
       ],
     });
 
-    const fluxosEnriquecidos = await Promise.all(
-      fluxos.map((fluxo) => enriquecerFluxoComCalculo(fluxo)),
-    );
+    const fluxosEnriquecidos = await enriquecerFluxosEmLote(fluxos);
 
     res.json(fluxosEnriquecidos);
   } catch (error) {
@@ -477,7 +505,14 @@ export const resumoFluxoCaixa = async (req, res) => {
     let valorTotalRetiradoDigital = 0;
     let valorTotalEsperado = 0;
 
-    for (const fluxo of fluxos) {
+    // Busca o histórico de todas as máquinas envolvidas em 1 única query, em
+    // vez de 1 Movimentacao.findAll por fluxo dentro do loop abaixo (sem
+    // filtro de loja, isso chegava a centenas de consultas sequenciais).
+    const calculos = await calcularEsperadoParaVariasMovimentacoes(
+      fluxos.map((fluxo) => fluxo.movimentacao),
+    );
+
+    for (const [index, fluxo] of fluxos.entries()) {
       if (fluxo.conferencia === "pendente") {
         totalPendentes++;
       } else if (fluxo.conferencia === "bateu") {
@@ -494,9 +529,7 @@ export const resumoFluxoCaixa = async (req, res) => {
       valorTotalRetiradoDigital += valorDigital;
       valorTotalRetirado += valorTotalLinha;
 
-      const calculo = await calcularValorEsperadoRetirada({
-        movimentacaoAtual: fluxo.movimentacao,
-      });
+      const calculo = calculos[index];
 
       const valorEsperadoManual = decimalOuNull(fluxo.valorEsperado);
       const valorEsperadoReferencia =
