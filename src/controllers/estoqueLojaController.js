@@ -641,6 +641,45 @@ export const deletarEstoqueLoja = async (req, res) => {
   }
 };
 
+// Obter alertas de estoque baixo de todas as lojas em uma única consulta
+// (evita fazer 1 requisição por loja no frontend, custoso com muitas lojas).
+export const alertasEstoqueTodasLojas = async (req, res) => {
+  try {
+    const estoques = await EstoqueLoja.findAll({
+      include: [
+        {
+          model: Produto,
+          as: "produto",
+          attributes: ["id", "nome", "codigo", "emoji", "estoqueMinimo"],
+        },
+        {
+          model: Loja,
+          as: "loja",
+          attributes: ["id", "nome"],
+        },
+      ],
+    });
+
+    const alertas = estoques.filter((est) => {
+      const minimoDefinido = est.estoqueMinimo || est.produto?.estoqueMinimo || 0;
+      return est.quantidade <= minimoDefinido;
+    });
+
+    res.json({
+      total: alertas.length,
+      alertas: alertas.map((a) => ({
+        produto: a.produto,
+        quantidade: a.quantidade,
+        estoqueMinimo: a.estoqueMinimo,
+        loja: a.loja,
+      })),
+    });
+  } catch (error) {
+    console.error("Erro ao buscar alertas de estoque de todas as lojas:", error);
+    res.status(500).json({ error: "Erro ao buscar alertas" });
+  }
+};
+
 // Obter alertas de estoque baixo
 export const alertasEstoqueLoja = async (req, res) => {
   try {

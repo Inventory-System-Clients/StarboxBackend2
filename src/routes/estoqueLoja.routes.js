@@ -5,6 +5,7 @@ import {
   atualizarVariosEstoques,
   deletarEstoqueLoja,
   alertasEstoqueLoja,
+  alertasEstoqueTodasLojas,
   criarOuAtualizarProdutoEstoque,
 } from "../controllers/estoqueLojaController.js";
 import { autenticar, registrarLog } from "../middlewares/auth.js";
@@ -26,6 +27,7 @@ router.use((req, res, next) => {
 // Caso contrário, Express pode confundir 'alertas' ou 'varios' com um produtoId
 
 // Rotas GET específicas primeiro
+router.get("/alertas", autenticar, alertasEstoqueTodasLojas);
 router.get("/:lojaId/alertas", autenticar, alertasEstoqueLoja);
 router.get("/:lojaId", autenticar, listarEstoqueLoja);
 
