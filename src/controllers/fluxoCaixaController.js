@@ -136,7 +136,8 @@ const enriquecerFluxosEmLote = async (fluxoInstances) => {
 // Listar todos os registros de fluxo de caixa (apenas movimentações marcadas como retirada de dinheiro)
 export const listarFluxoCaixa = async (req, res) => {
   try {
-    const { dataInicio, dataFim, lojaId, status, roteiroId } = req.query;
+    const { dataInicio, dataFim, lojaId, status, roteiroId, cidade, estado } =
+      req.query;
 
     // Construir filtros para a busca
     const whereMovimentacao = {};
@@ -164,6 +165,12 @@ export const listarFluxoCaixa = async (req, res) => {
 
     if (lojaId) {
       whereLoja.id = lojaId;
+    }
+    if (cidade) {
+      whereLoja.cidade = cidade;
+    }
+    if (estado) {
+      whereLoja.estado = estado;
     }
 
     if (roteiroId) {
@@ -446,7 +453,7 @@ export const atualizarFluxoCaixa = async (req, res) => {
 // Obter resumo/estatísticas do fluxo de caixa
 export const resumoFluxoCaixa = async (req, res) => {
   try {
-    const { dataInicio, dataFim, lojaId } = req.query;
+    const { dataInicio, dataFim, lojaId, cidade, estado } = req.query;
 
     if (!dataInicio || !dataFim) {
       return res
@@ -470,7 +477,10 @@ export const resumoFluxoCaixa = async (req, res) => {
       [Op.and]: [filtroDataLocal],
     };
 
-    const whereLoja = lojaId ? { id: lojaId } : {};
+    const whereLoja = {};
+    if (lojaId) whereLoja.id = lojaId;
+    if (cidade) whereLoja.cidade = cidade;
+    if (estado) whereLoja.estado = estado;
 
     const fluxos = await FluxoCaixa.findAll({
       include: [
