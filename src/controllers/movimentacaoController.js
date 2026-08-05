@@ -1271,37 +1271,61 @@ export const listarMovimentacoes = async (req, res) => {
     // Normaliza a resposta: expõe lojaId diretamente (via maquina.lojaId)
     const LogOrdemRoteiro = (await import("../models/LogOrdemRoteiro.js"))
       .default;
-    const result = await Promise.all(
-      movimentacoes.map(async (mov) => {
-        const json = mov.toJSON();
-        if (!json.lojaId && json.maquina?.lojaId) {
-          json.lojaId = json.maquina.lojaId;
+
+    const jsonMovimentacoes = movimentacoes.map((mov) => {
+      const json = mov.toJSON();
+      if (!json.lojaId && json.maquina?.lojaId) {
+        json.lojaId = json.maquina.lojaId;
+      }
+      return json;
+    });
+
+    // Busca em uma única consulta os logs de quebra de ordem de todas as
+    // movimentações da página, em vez de 1 consulta por movimentação (com
+    // muitas quebras de ordem no período, isso esgotava o pool de conexões).
+    const paresJustificativa = new Map();
+    for (const json of jsonMovimentacoes) {
+      if (json.justificativa_ordem && json.lojaId) {
+        paresJustificativa.set(`${json.lojaId}::${json.justificativa_ordem}`, {
+          lojaId: json.lojaId,
+          justificativa: json.justificativa_ordem,
+        });
+      }
+    }
+
+    const logPorPar = new Map();
+    if (paresJustificativa.size > 0) {
+      const pares = Array.from(paresJustificativa.values());
+      const logs = await LogOrdemRoteiro.findAll({
+        where: {
+          lojaId: { [Op.in]: [...new Set(pares.map((p) => p.lojaId))] },
+          justificativa: { [Op.in]: [...new Set(pares.map((p) => p.justificativa))] },
+        },
+        order: [["createdAt", "DESC"]],
+      });
+      // Ordenado DESC: a primeira ocorrência de cada par é a mais recente.
+      for (const log of logs) {
+        const chave = `${log.lojaId}::${log.justificativa}`;
+        if (!logPorPar.has(chave)) {
+          logPorPar.set(chave, log);
         }
-        // Se houve quebra de ordem, buscar info do log
-        if (json.justificativa_ordem) {
-          const log = await LogOrdemRoteiro.findOne({
-            where: {
-              lojaId: json.lojaId,
-              justificativa: json.justificativa_ordem,
-            },
-            order: [["createdAt", "DESC"]],
-          });
-          if (log) {
-            json.lojaIdEsperada = log.lojaEsperadaId || null;
-            json.lojaEsperadaNome = log.lojaEsperadaNome || null;
-          } else {
-            json.lojaIdEsperada = null;
-            json.lojaEsperadaNome = null;
-          }
-        } else {
-          json.lojaIdEsperada = null;
-          json.lojaEsperadaNome = null;
-        }
-        // Expor nome da loja visitada
-        json.lojaNome = json.maquina?.loja?.nome || null;
-        return json;
-      }),
-    );
+      }
+    }
+
+    const result = jsonMovimentacoes.map((json) => {
+      if (json.justificativa_ordem && json.lojaId) {
+        const log = logPorPar.get(`${json.lojaId}::${json.justificativa_ordem}`);
+        json.lojaIdEsperada = log?.lojaEsperadaId || null;
+        json.lojaEsperadaNome = log?.lojaEsperadaNome || null;
+      } else {
+        json.lojaIdEsperada = null;
+        json.lojaEsperadaNome = null;
+      }
+      // Expor nome da loja visitada
+      json.lojaNome = json.maquina?.loja?.nome || null;
+      return json;
+    });
+
     res.json(buildPaginatedResponse(result, count, params));
   } catch (error) {
     console.error("Erro ao listar movimentações:", error);
