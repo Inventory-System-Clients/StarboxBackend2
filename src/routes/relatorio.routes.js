@@ -1,6 +1,7 @@
 import express from "express";
 import {
   balançoSemanal,
+  alertaInatividadeLojas,
   alertasEstoque,
   performanceMaquinas,
   relatorioImpressao,
@@ -32,6 +33,9 @@ router.get("/roteiro", autenticar, autorizar("ADMIN"), relatorioRoteiro);
 
 // Todas as rotas de relatórios são restritas a ADMIN
 router.get("/balanco-semanal", autenticar, autorizar("ADMIN"), balançoSemanal);
+// Sem restrição de ADMIN: o alerta de inatividade aparece na navbar/dashboard
+// pra outros papéis também (mesmo padrão de /estoque-lojas/alertas).
+router.get("/alertas-inatividade-lojas", autenticar, alertaInatividadeLojas);
 router.get(
   "/alertas-movimentacao-inconsistente",
   autenticar,

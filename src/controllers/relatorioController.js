@@ -655,7 +655,10 @@ import {
   FluxoCaixa,
   ValorEsperadoMovimentacao,
 } from "../models/index.js";
-import { getUltimaMovimentacaoPorMaquina } from "../utils/movimentacaoQueries.js";
+import {
+  getUltimaMovimentacaoPorMaquina,
+  getInatividadePorLoja,
+} from "../utils/movimentacaoQueries.js";
 
 // --- DASHBOARD GERAL ---
 export const dashboardRelatorio = async (req, res) => {
@@ -1189,14 +1192,15 @@ export const balançoSemanal = async (req, res) => {
       (acc, mov) => {
         const fqtd = mov.fichas || 0;
         const vf = parseFloat(mov.maquina?.valorFicha || 0);
-        const fat =
-          fqtd * vf +
-          parseFloat(mov.quantidade_notas_entrada || 0) +
-          parseFloat(mov.valor_entrada_maquininha_pix || 0);
+        const dinheiro = parseFloat(mov.quantidade_notas_entrada || 0);
+        const cartaoPix = parseFloat(mov.valor_entrada_maquininha_pix || 0);
+        const fat = fqtd * vf + dinheiro + cartaoPix;
         acc.totalFichas += fqtd;
         acc.totalFaturamento += fat;
         acc.totalSairam += mov.sairam || 0;
         acc.totalAbastecidas += mov.abastecidas || 0;
+        acc.totalDinheiro += dinheiro;
+        acc.totalCartaoPix += cartaoPix;
         return acc;
       },
       {
@@ -1204,6 +1208,8 @@ export const balançoSemanal = async (req, res) => {
         totalFaturamento: 0,
         totalSairam: 0,
         totalAbastecidas: 0,
+        totalDinheiro: 0,
+        totalCartaoPix: 0,
       },
     );
 
@@ -1211,6 +1217,7 @@ export const balançoSemanal = async (req, res) => {
       totais.totalSairam > 0
         ? (totais.totalFichas / totais.totalSairam).toFixed(2)
         : 0;
+    totais.receitaReal = totais.totalDinheiro + totais.totalCartaoPix;
 
     const produtosMap = {};
     movimentacoes.forEach((mov) => {
@@ -1282,6 +1289,62 @@ export const balançoSemanal = async (req, res) => {
   } catch (error) {
     console.error("Erro ao gerar balanço semanal:", error);
     res.status(500).json({ error: "Erro ao gerar balanço semanal" });
+  }
+};
+
+// --- ALERTA DE INATIVIDADE POR LOJA ---
+// Lojas sem movimentação e sem retirada de dinheiro há mais de N dias.
+// Calculado com 2 queries agregadas (MAX por loja) em vez de baixar todas as
+// movimentações/fluxo de caixa do período pro frontend calcular na mão.
+export const alertaInatividadeLojas = async (req, res) => {
+  try {
+    const diasLimite = parseInt(req.query.dias, 10) || 15;
+    const diasJanela = parseInt(req.query.diasJanela, 10) || 90;
+
+    const hoje = new Date();
+    const dataInicio = new Date(hoje.getTime() - diasJanela * 24 * 60 * 60 * 1000);
+
+    const [{ ultimaMovimentacaoPorLoja, ultimaRetiradaPorLoja }, lojas] =
+      await Promise.all([
+        getInatividadePorLoja(dataInicio),
+        Loja.findAll({
+          attributes: ["id", "nome", "isDepositoPrincipal"],
+          raw: true,
+        }),
+      ]);
+
+    const MS_DIA = 24 * 60 * 60 * 1000;
+    const lojasComAlerta = lojas
+      .filter((loja) => !loja.isDepositoPrincipal)
+      .map((loja) => {
+        const ultimaMovimentacao = ultimaMovimentacaoPorLoja.get(loja.id) || null;
+        const ultimaRetirada = ultimaRetiradaPorLoja.get(loja.id) || null;
+
+        const diasSemMov = ultimaMovimentacao
+          ? Math.floor((hoje - new Date(ultimaMovimentacao)) / MS_DIA)
+          : 9999;
+        const diasSemRetirada = ultimaRetirada
+          ? Math.floor((hoje - new Date(ultimaRetirada)) / MS_DIA)
+          : 9999;
+
+        return {
+          lojaId: loja.id,
+          lojaNome: loja.nome,
+          ultimaMovimentacao,
+          ultimaRetirada,
+          diasSemMov,
+          diasSemRetirada,
+        };
+      })
+      .filter(
+        (loja) => loja.diasSemMov > diasLimite && loja.diasSemRetirada > diasLimite,
+      )
+      .sort((a, b) => b.diasSemMov - a.diasSemMov);
+
+    res.json({ lojas: lojasComAlerta });
+  } catch (error) {
+    console.error("Erro ao calcular alerta de inatividade de lojas:", error);
+    res.status(500).json({ error: "Erro ao calcular alerta de inatividade de lojas" });
   }
 };
 
