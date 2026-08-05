@@ -1,16 +1,22 @@
 import { Op } from "sequelize";
-import { Loja, Maquina, UsuarioLoja } from "../models/index.js";
+import { Loja, Maquina, UsuarioLoja, RoteiroLoja } from "../models/index.js";
 import { parseListParams, buildPaginatedResponse } from "../utils/pagination.js";
 
 // US04 - Listar todas as lojas
 export const listarLojas = async (req, res) => {
   try {
-    const { busca, ativo } = req.query;
+    const { busca, ativo, cidade, estado, roteiroId } = req.query;
     const params = parseListParams(req.query, { defaultPageSize: 20 });
 
     const where = {};
     if (ativo !== undefined) {
       where.ativo = ativo === "true";
+    }
+    if (cidade) {
+      where.cidade = cidade;
+    }
+    if (estado) {
+      where.estado = estado;
     }
     if (busca) {
       where[Op.or] = [
@@ -30,6 +36,18 @@ export const listarLojas = async (req, res) => {
         attributes: ["lojaId"],
       });
       where.id = { [Op.in]: permissoes.map((p) => p.lojaId) };
+    }
+
+    if (roteiroId) {
+      const roteiroLojas = await RoteiroLoja.findAll({
+        where: { RoteiroId: roteiroId },
+        attributes: ["LojaId"],
+        raw: true,
+      });
+      const idsDaRota = roteiroLojas.map((rl) => rl.LojaId);
+      where.id = where.id
+        ? { [Op.and]: [where.id, { [Op.in]: idsDaRota }] }
+        : { [Op.in]: idsDaRota };
     }
 
     const include = [

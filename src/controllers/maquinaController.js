@@ -4,6 +4,7 @@ import {
   Movimentacao,
   MovimentacaoProduto,
   GastoFixoLoja,
+  RoteiroLoja,
 } from "../models/index.js";
 import { Op } from "sequelize";
 import { parseListParams, buildPaginatedResponse } from "../utils/pagination.js";
@@ -283,7 +284,8 @@ export const calcularQuantidadeAtual = async (req, res) => {
 // US05 - Listar máquinas
 export const listarMaquinas = async (req, res) => {
   try {
-    const { lojaId, incluirInativas, busca } = req.query;
+    const { lojaId, incluirInativas, busca, cidade, estado, roteiroId } =
+      req.query;
     const params = parseListParams(req.query, { defaultPageSize: 20 });
     const where = {};
 
@@ -304,11 +306,30 @@ export const listarMaquinas = async (req, res) => {
       ];
     }
 
+    if (roteiroId) {
+      const roteiroLojas = await RoteiroLoja.findAll({
+        where: { RoteiroId: roteiroId },
+        attributes: ["LojaId"],
+        raw: true,
+      });
+      const idsDaRota = roteiroLojas.map((rl) => rl.LojaId);
+      where.lojaId = where.lojaId
+        ? { [Op.and]: [where.lojaId, { [Op.in]: idsDaRota }] }
+        : { [Op.in]: idsDaRota };
+    }
+
+    const lojaWhere = {};
+    if (cidade) lojaWhere.cidade = cidade;
+    if (estado) lojaWhere.estado = estado;
+
     const include = [
       {
         model: Loja,
         as: "loja",
         attributes: ["id", "nome", "cidade"],
+        ...(Object.keys(lojaWhere).length > 0
+          ? { where: lojaWhere, required: true }
+          : {}),
       },
     ];
     const order = [["codigo", "ASC"]];
