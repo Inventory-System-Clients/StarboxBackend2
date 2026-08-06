@@ -5,6 +5,7 @@ import {
   alertasEstoque,
   performanceMaquinas,
   relatorioImpressao,
+  relatorioImpressaoLote,
   relatorioTodasLojas,
   rankingLucroBrutoLojas,
   buscarAlertasDeInconsistencia,
@@ -56,6 +57,12 @@ router.get(
   performanceMaquinas,
 );
 router.get("/impressao", autenticar, autorizar("ADMIN"), relatorioImpressao);
+router.get(
+  "/impressao-lote",
+  autenticar,
+  autorizar("ADMIN"),
+  relatorioImpressaoLote,
+);
 router.get("/todas-lojas", autenticar, autorizar("ADMIN"), relatorioTodasLojas);
 router.get(
   "/ranking-lucro-bruto-lojas",

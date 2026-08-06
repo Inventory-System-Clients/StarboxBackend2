@@ -39,6 +39,45 @@ export const listarGastosFixosPorLoja = async (req, res) => {
   }
 };
 
+// Gastos fixos de várias lojas em 1 única query, pro relatório consolidado
+// (evita 1 requisição por loja).
+export const listarGastosFixosPorLojasEmLote = async (req, res) => {
+  try {
+    const idsArray = String(req.query.lojaIds || "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+
+    if (idsArray.length === 0) {
+      return res.status(400).json({ error: "lojaIds é obrigatório" });
+    }
+
+    const gastos = await GastoFixoLoja.findAll({
+      where: { lojaId: idsArray },
+      attributes: ["id", "lojaId", "nome", "valor", "createdAt", "updatedAt"],
+      order: [["createdAt", "ASC"]],
+      raw: true,
+    });
+
+    const porLoja = {};
+    for (const idLoja of idsArray) {
+      porLoja[idLoja] = [];
+    }
+    for (const gasto of gastos) {
+      const idLoja = String(gasto.lojaId);
+      if (!porLoja[idLoja]) porLoja[idLoja] = [];
+      porLoja[idLoja].push(gasto);
+    }
+
+    return res.json({ porLoja });
+  } catch (error) {
+    console.error("Erro ao listar gastos fixos em lote:", error);
+    return res
+      .status(500)
+      .json({ error: "Erro ao listar gastos fixos em lote" });
+  }
+};
+
 export const salvarGastosFixosPorLoja = async (req, res) => {
   const transaction = await sequelize.transaction();
 

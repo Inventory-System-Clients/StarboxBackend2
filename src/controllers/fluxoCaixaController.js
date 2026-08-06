@@ -136,8 +136,16 @@ const enriquecerFluxosEmLote = async (fluxoInstances) => {
 // Listar todos os registros de fluxo de caixa (apenas movimentações marcadas como retirada de dinheiro)
 export const listarFluxoCaixa = async (req, res) => {
   try {
-    const { dataInicio, dataFim, lojaId, status, roteiroId, cidade, estado } =
-      req.query;
+    const {
+      dataInicio,
+      dataFim,
+      lojaId,
+      lojaIds,
+      status,
+      roteiroId,
+      cidade,
+      estado,
+    } = req.query;
 
     // Construir filtros para a busca
     const whereMovimentacao = {};
@@ -165,6 +173,15 @@ export const listarFluxoCaixa = async (req, res) => {
 
     if (lojaId) {
       whereLoja.id = lojaId;
+    }
+    if (lojaIds) {
+      const idsArray = String(lojaIds)
+        .split(",")
+        .map((id) => id.trim())
+        .filter(Boolean);
+      if (idsArray.length > 0) {
+        whereLoja.id = { [Op.in]: idsArray };
+      }
     }
     if (cidade) {
       whereLoja.cidade = cidade;

@@ -1895,89 +1895,65 @@ const gerarConsolidadoTodasLojas = async ({ dataInicio, dataFim }) => {
 };
 
 // --- RELATÓRIO DE IMPRESSÃO (RESTAURADO E CORRIGIDO) ---
-export const relatorioImpressao = async (req, res) => {
-  try {
-    const { lojaId, dataInicio, dataFim, roteiroId } = req.query;
+// Attributes/include compartilhados entre o relatório de uma loja e o
+// relatório em lote (várias lojas de uma vez) — `whereMaquina` é o único
+// ponto que muda entre os dois (uma loja específica vs. IN de várias).
+const ATRIBUTOS_PRODUTO_RELATORIO = [
+  "id",
+  "nome",
+  "codigo",
+  "emoji",
+  "preco",
+  "custoUnitario",
+];
 
-    if (!lojaId) {
-      return res.status(400).json({ error: "lojaId é obrigatório" });
-    }
+const montarIncludeMovimentacaoRelatorio = (whereMaquina) => [
+  {
+    model: Maquina,
+    as: "maquina",
+    where: whereMaquina,
+    attributes: ["id", "codigo", "nome", "valorFicha", "lojaId"],
+  },
+  {
+    model: FluxoCaixa,
+    as: "fluxoCaixa",
+    required: false,
+    attributes: ["valorRetirado", "conferencia"],
+  },
+  {
+    model: MovimentacaoProduto,
+    as: "detalhesProdutos",
+    include: [
+      {
+        model: Produto,
+        as: "produto",
+        attributes: ATRIBUTOS_PRODUTO_RELATORIO,
+      },
+    ],
+  },
+  {
+    model: Produto,
+    as: "produtoNaMaquina",
+    required: false,
+    attributes: ATRIBUTOS_PRODUTO_RELATORIO,
+  },
+];
 
-    if (!dataInicio || !dataFim) {
-      return res
-        .status(400)
-        .json({ error: "dataInicio e dataFim são obrigatórios" });
-    }
-
-    const inicio = new Date(dataInicio);
-    const fim = new Date(dataFim);
-    fim.setHours(23, 59, 59, 999);
-
-    const loja = await Loja.findByPk(lojaId);
-    if (!loja) {
-      return res.status(404).json({ error: "Loja não encontrada" });
-    }
-
+// Toda a agregação do relatório de impressão de UMA loja, a partir de
+// movimentações já buscadas — usado tanto pelo relatório de loja única
+// quanto pelo relatório em lote (que busca as movimentações de todas as
+// lojas pedidas em 1 única query e chama esta função pra cada grupo).
+const montarRelatorioDeUmaLoja = async ({
+  loja,
+  movimentacoes,
+  periodoInicio,
+  periodoFim,
+}) => {
     // Sem RegistroDinheiro, os totais financeiros são consolidados pelas
     // movimentações e valores conferidos no fluxo de caixa por máquina.
     let valorTotalLoja = 0;
     let valorDinheiroLoja = 0;
     let valorCartaoPixLoja = 0;
-
-    // Buscar movimentações normalmente
-    const movimentacoes = await Movimentacao.findAll({
-      where: {
-        dataColeta: {
-          [Op.between]: [inicio, fim],
-        },
-      },
-      include: [
-        {
-          model: Maquina,
-          as: "maquina",
-          where: { lojaId },
-          attributes: ["id", "codigo", "nome", "valorFicha"],
-        },
-        {
-          model: FluxoCaixa,
-          as: "fluxoCaixa",
-          required: false,
-          attributes: ["valorRetirado", "conferencia"],
-        },
-        {
-          model: MovimentacaoProduto,
-          as: "detalhesProdutos",
-          include: [
-            {
-              model: Produto,
-              as: "produto",
-              attributes: [
-                "id",
-                "nome",
-                "codigo",
-                "emoji",
-                "preco",
-                "custoUnitario",
-              ],
-            },
-          ],
-        },
-        {
-          model: Produto,
-          as: "produtoNaMaquina",
-          required: false,
-          attributes: [
-            "id",
-            "nome",
-            "codigo",
-            "emoji",
-            "preco",
-            "custoUnitario",
-          ],
-        },
-      ],
-      order: [["dataColeta", "DESC"]],
-    });
 
     // Sem lançamento específico da loja, mantém totais da loja zerados e
     // utiliza os totais de máquinas para o consolidado.
@@ -2478,15 +2454,15 @@ export const relatorioImpressao = async (req, res) => {
       quantidade: p.quantidade,
     }));
 
-    res.json({
+    return {
       loja: {
         id: loja.id,
         nome: loja.nome,
         endereco: loja.endereco,
       },
       periodo: {
-        inicio: inicio.toISOString(),
-        fim: fim.toISOString(),
+        inicio: periodoInicio.toISOString(),
+        fim: periodoFim.toISOString(),
       },
       totais: {
         fichas: totalFichas,
@@ -2538,11 +2514,134 @@ export const relatorioImpressao = async (req, res) => {
       graficoSaidaPorMaquina,
       graficoSaidaPorProduto,
       avisoFichas,
+    };
+};
+
+export const relatorioImpressao = async (req, res) => {
+  try {
+    const { lojaId, dataInicio, dataFim } = req.query;
+
+    if (!lojaId) {
+      return res.status(400).json({ error: "lojaId é obrigatório" });
+    }
+
+    if (!dataInicio || !dataFim) {
+      return res
+        .status(400)
+        .json({ error: "dataInicio e dataFim são obrigatórios" });
+    }
+
+    const inicio = new Date(dataInicio);
+    const fim = new Date(dataFim);
+    fim.setHours(23, 59, 59, 999);
+
+    const loja = await Loja.findByPk(lojaId);
+    if (!loja) {
+      return res.status(404).json({ error: "Loja não encontrada" });
+    }
+
+    const movimentacoes = await Movimentacao.findAll({
+      where: {
+        dataColeta: {
+          [Op.between]: [inicio, fim],
+        },
+      },
+      include: montarIncludeMovimentacaoRelatorio({ lojaId }),
+      order: [["dataColeta", "DESC"]],
     });
+
+    const resultado = await montarRelatorioDeUmaLoja({
+      loja,
+      movimentacoes,
+      periodoInicio: inicio,
+      periodoFim: fim,
+    });
+
+    res.json(resultado);
   } catch (error) {
     console.error("Erro ao gerar relatório de impressão:", error);
     res.status(500).json({
       error: "Erro ao gerar relatório de impressão",
+      message:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+};
+
+// Mesmo relatório de impressão, mas para várias lojas de uma vez: busca as
+// movimentações de todas as lojas pedidas em 1 única query (em vez de 1
+// requisição HTTP + 1 query por loja, que com muitas lojas esgotava o pool
+// de conexões e demorava minutos), depois roda a mesma agregação por grupo.
+export const relatorioImpressaoLote = async (req, res) => {
+  try {
+    const { lojaIds, dataInicio, dataFim } = req.query;
+
+    const idsArray = String(lojaIds || "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+
+    if (idsArray.length === 0) {
+      return res.status(400).json({ error: "lojaIds é obrigatório" });
+    }
+
+    if (!dataInicio || !dataFim) {
+      return res
+        .status(400)
+        .json({ error: "dataInicio e dataFim são obrigatórios" });
+    }
+
+    const inicio = new Date(dataInicio);
+    const fim = new Date(dataFim);
+    fim.setHours(23, 59, 59, 999);
+
+    const lojasEncontradas = await Loja.findAll({
+      where: { id: { [Op.in]: idsArray } },
+    });
+    const lojaPorId = new Map(
+      lojasEncontradas.map((loja) => [String(loja.id), loja]),
+    );
+
+    const todasMovimentacoes = await Movimentacao.findAll({
+      where: {
+        dataColeta: {
+          [Op.between]: [inicio, fim],
+        },
+      },
+      include: montarIncludeMovimentacaoRelatorio({
+        lojaId: { [Op.in]: idsArray },
+      }),
+      order: [["dataColeta", "DESC"]],
+    });
+
+    const movimentacoesPorLoja = new Map();
+    for (const mov of todasMovimentacoes) {
+      const lojaIdDaMov = String(mov.maquina?.lojaId || "");
+      if (!lojaIdDaMov) continue;
+      if (!movimentacoesPorLoja.has(lojaIdDaMov)) {
+        movimentacoesPorLoja.set(lojaIdDaMov, []);
+      }
+      movimentacoesPorLoja.get(lojaIdDaMov).push(mov);
+    }
+
+    const porLoja = {};
+    for (const idLoja of idsArray) {
+      const loja = lojaPorId.get(String(idLoja));
+      if (!loja) continue;
+
+      porLoja[idLoja] = await montarRelatorioDeUmaLoja({
+        loja,
+        movimentacoes: movimentacoesPorLoja.get(String(idLoja)) || [],
+        periodoInicio: inicio,
+        periodoFim: fim,
+      });
+    }
+
+    res.json({ porLoja });
+  } catch (error) {
+    console.error("Erro ao gerar relatório em lote:", error);
+    res.status(500).json({
+      error: "Erro ao gerar relatório em lote",
       message:
         process.env.NODE_ENV === "development" ? error.message : undefined,
     });
