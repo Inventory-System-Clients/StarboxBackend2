@@ -10,6 +10,8 @@ import {
   relatorioMovimentacoesDia,
   relatorioLucroTotalDia,
   relatorioComissaoTotalDia,
+  atualizarResumoWhatsAppMovimentacao,
+  listarLeiturasWhatsAppDaLoja,
 } from "../controllers/movimentacaoController.js";
 import { autenticar, autorizar, registrarLog } from "../middlewares/auth.js";
 
@@ -39,6 +41,14 @@ router.get(
 router.get("/relatorio/lucro-dia", autenticar, relatorioLucroTotalDia);
 router.get("/relatorio/comissao-dia", autenticar, relatorioComissaoTotalDia);
 
+// Leituras de um ponto (loja) do roteiro para montar a mensagem de WhatsApp.
+// Precisa vir antes de "/:id" para nao ser capturada pela rota de parametro.
+router.get(
+  "/leituras-whatsapp",
+  autenticar,
+  listarLeiturasWhatsAppDaLoja,
+);
+
 router.get("/:id", autenticar, obterMovimentacao);
 router.post(
   "/",
@@ -57,6 +67,11 @@ router.patch(
   autenticar,
   registrarLog("ABASTECIMENTO_EXTRA_MOVIMENTACAO", "Movimentacao"),
   registrarAbastecimentoExtra,
+);
+router.patch(
+  "/:id/resumo-whatsapp",
+  autenticar,
+  atualizarResumoWhatsAppMovimentacao,
 );
 router.delete(
   "/:id",

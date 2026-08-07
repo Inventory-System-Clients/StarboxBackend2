@@ -1333,6 +1333,85 @@ export const listarMovimentacoes = async (req, res) => {
   }
 };
 
+// Salva o resumo estruturado usado para montar a mensagem de WhatsApp desta
+// leitura. Chamado pelo frontend logo apos registrar/editar uma movimentacao,
+// para que o botao "Enviar leituras do ponto no WhatsApp" nao dependa mais do
+// localStorage do navegador (o que impedia o envio quando a leitura era feita
+// em um dispositivo/navegador diferente de onde o envio era clicado).
+export const atualizarResumoWhatsAppMovimentacao = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { resumo } = req.body;
+
+    if (!resumo || typeof resumo !== "object" || Array.isArray(resumo)) {
+      return res.status(400).json({ error: "resumo deve ser um objeto" });
+    }
+
+    const movimentacao = await Movimentacao.findByPk(id);
+    if (!movimentacao) {
+      return res.status(404).json({ error: "Movimentação não encontrada" });
+    }
+
+    await movimentacao.update({ resumoWhatsapp: resumo });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Erro ao salvar resumo de WhatsApp da movimentação:", error);
+    res.status(500).json({ error: "Erro ao salvar resumo de WhatsApp" });
+  }
+};
+
+// Lista as leituras de um ponto (loja) desde o inicio da execucao semanal
+// atual do roteiro, para montar a mensagem de WhatsApp. Fonte de verdade no
+// banco - funciona independente de em qual dispositivo/navegador a leitura
+// foi feita, e pode ser chamada quantas vezes for preciso (reenvio) porque
+// nao existe conceito de "ja enviada": cada leitura (uma por movimentacao,
+// mesmo que duas tenham sido feitas na mesma maquina) sempre entra de novo.
+export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
+  try {
+    const { roteiroId, lojaId } = req.query;
+
+    if (!roteiroId || !lojaId) {
+      return res
+        .status(400)
+        .json({ error: "roteiroId e lojaId são obrigatórios" });
+    }
+
+    const contexto = await resolverContextoExecucaoSemanal(roteiroId);
+    const inicioExecucao = new Date(`${contexto.dataInicio}T00:00:00.000Z`);
+
+    const movimentacoes = await Movimentacao.findAll({
+      where: {
+        roteiroId,
+        resumoWhatsapp: { [Op.ne]: null },
+        dataColeta: { [Op.gte]: inicioExecucao },
+      },
+      include: [
+        {
+          model: Maquina,
+          as: "maquina",
+          attributes: ["id", "nome", "codigo", "lojaId"],
+          where: { lojaId },
+        },
+      ],
+      order: [["dataColeta", "ASC"]],
+    });
+
+    const itens = movimentacoes.map((mov) => ({
+      id: mov.id,
+      maquinaId: mov.maquinaId,
+      maquinaNome: mov.maquina?.nome || mov.maquina?.codigo || mov.maquinaId,
+      resumo: mov.resumoWhatsapp,
+      createdAt: mov.dataColeta,
+    }));
+
+    res.json(itens);
+  } catch (error) {
+    console.error("Erro ao listar leituras de WhatsApp da loja:", error);
+    res.status(500).json({ error: "Erro ao listar leituras de WhatsApp" });
+  }
+};
+
 // Obter movimentação por ID
 export const obterMovimentacao = async (req, res) => {
   try {

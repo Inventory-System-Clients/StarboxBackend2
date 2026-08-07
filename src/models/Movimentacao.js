@@ -182,6 +182,15 @@ const Movimentacao = sequelize.define(
       type: DataTypes.UUID,
       allowNull: true,
     },
+
+    // Mensagem de WhatsApp da leitura (US - leituras pendentes por ponto)
+    resumoWhatsapp: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      field: "resumo_whatsapp",
+      comment:
+        "Resumo estruturado usado para montar a mensagem de WhatsApp desta leitura",
+    },
     produtoNaMaquinaId: {
       type: DataTypes.UUID,
       allowNull: true,
