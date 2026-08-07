@@ -56,10 +56,16 @@ const ROLES_OPERACAO_ROTEIRO = [
   "ABASTECEDOR",
 ];
 
-const usuarioPodeAssumirExecucao = (execucao, usuarioId) => {
+const usuarioPodeAssumirExecucao = (execucao, usuarioId, funcionarioAtualId) => {
   if (!execucao?.emAndamento) return true;
   if (!execucao.usuarioId) return true;
-  return String(execucao.usuarioId) === String(usuarioId || "");
+  if (String(execucao.usuarioId) === String(usuarioId || "")) return true;
+  // O responsavel atual do roteiro (apos uma reatribuicao) sempre pode
+  // assumir a execucao, mesmo que ela tenha sido iniciada por outra pessoa.
+  return (
+    Boolean(funcionarioAtualId) &&
+    String(funcionarioAtualId) === String(usuarioId || "")
+  );
 };
 
 const roteiroFoiFinalizadoNoCicloAtual = async (roteiroId, transaction) => {
@@ -219,7 +225,13 @@ router.post(
         });
       }
 
-      if (!usuarioPodeAssumirExecucao(execucaoExistente, req.usuario?.id)) {
+      if (
+        !usuarioPodeAssumirExecucao(
+          execucaoExistente,
+          req.usuario?.id,
+          roteiro.funcionarioId,
+        )
+      ) {
         return res.status(409).json({
           error: "Este roteiro ja esta em uso por outro usuario",
           statusRota: "em_uso_por_outro_usuario",
@@ -361,7 +373,10 @@ router.post(
 
       if (execucaoExistente?.emAndamento) {
         const updateExecucao = {};
-        if (!execucaoExistente.usuarioId && req.usuario?.id) {
+        if (
+          req.usuario?.id &&
+          String(execucaoExistente.usuarioId || "") !== String(req.usuario.id)
+        ) {
           updateExecucao.usuarioId = req.usuario.id;
         }
         if (execucaoExistente.finalizadoEm) {
@@ -1006,6 +1021,23 @@ router.patch(
       }
 
       await roteiro.update(update);
+
+      // Reatribuir o roteiro para outro funcionario deve transferir a
+      // execucao em andamento para o novo responsavel, senao ele fica
+      // preso na visualizacao em modo leitura (achando que o roteiro
+      // ainda "pertence" a quem o iniciou antes da reatribuicao).
+      if (update.funcionarioId) {
+        const execucaoAtiva = await RoteiroExecucaoSemanal.findOne({
+          where: { roteiroId: roteiro.id, emAndamento: true },
+        });
+        if (
+          execucaoAtiva &&
+          String(execucaoAtiva.usuarioId || "") !== String(update.funcionarioId)
+        ) {
+          await execucaoAtiva.update({ usuarioId: update.funcionarioId });
+        }
+      }
+
       res.json(roteiro);
     } catch (error) {
       if (error.status) {
