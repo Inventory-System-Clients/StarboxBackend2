@@ -56,6 +56,12 @@ const Roteiro = sequelize.define(
       defaultValue: [],
       field: "dias_semana",
     },
+    permiteGastos: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: true,
+      field: "permiteGastos",
+    },
   },
   {
     hooks: {

@@ -390,6 +390,7 @@ async function getRoteiroExecucaoComStatus(req, res) {
       nome: roteiro.nome,
       observacao: roteiro.observacao,
       funcionarioAbastecedor,
+      permiteGastos: roteiro.permiteGastos !== false,
       veiculoId: roteiro.veiculoId ?? null,
       veiculo: roteiro.veiculo
         ? {

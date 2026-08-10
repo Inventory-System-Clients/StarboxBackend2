@@ -203,6 +203,7 @@ export const criarRoteiro = async (req, res) => {
       orcamentoSemanal,
       orcamentoDiario,
       veiculoId,
+      permiteGastos,
     } = req.body;
     const orcamentoRecebido =
       orcamentoSemanal !== undefined ? orcamentoSemanal : orcamentoDiario;
@@ -239,6 +240,7 @@ export const criarRoteiro = async (req, res) => {
       diasSemana: diasSemana ?? [],
       observacao: observacao?.trim() || null,
       veiculoId: veiculoIdNormalizado,
+      permiteGastos: permiteGastos === undefined ? true : Boolean(permiteGastos),
       ...(orcamentoRecebido !== undefined
         ? {
             orcamentoDiario: Number.parseFloat(
@@ -296,6 +298,10 @@ export const atualizarDiasSemana = async (req, res) => {
         });
       }
       updateData.orcamentoDiario = Number.parseFloat(valorOrcamento.toFixed(2));
+    }
+
+    if (outrosCampos.permiteGastos !== undefined) {
+      updateData.permiteGastos = Boolean(outrosCampos.permiteGastos);
     }
 
     if (outrosCampos.veiculoId !== undefined) {

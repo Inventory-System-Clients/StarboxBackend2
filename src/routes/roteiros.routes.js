@@ -979,11 +979,16 @@ router.patch(
         "nome",
         "observacao",
         "veiculoId",
+        "permiteGastos",
       ];
       const update = {};
       camposPermitidos.forEach((c) => {
         if (req.body[c] !== undefined) update[c] = req.body[c];
       });
+
+      if (update.permiteGastos !== undefined) {
+        update.permiteGastos = Boolean(update.permiteGastos);
+      }
 
       if (hasFuncionarioPayload(req.body)) {
         Object.assign(
