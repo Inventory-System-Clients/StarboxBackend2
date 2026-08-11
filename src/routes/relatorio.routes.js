@@ -3,6 +3,7 @@ import {
   balançoSemanal,
   alertaInatividadeLojas,
   alertasEstoque,
+  alertasLeituraAntiga,
   performanceMaquinas,
   relatorioImpressao,
   relatorioImpressaoLote,
@@ -50,6 +51,12 @@ router.delete(
   ignorarAlertaMovimentacao,
 );
 router.get("/alertas-estoque", autenticar, autorizar("ADMIN"), alertasEstoque);
+router.get(
+  "/alertas-leitura-antiga",
+  autenticar,
+  autorizar("ADMIN"),
+  alertasLeituraAntiga,
+);
 router.get(
   "/performance-maquinas",
   autenticar,

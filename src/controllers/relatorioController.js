@@ -1425,6 +1425,70 @@ export const alertasEstoque = async (req, res) => {
   }
 };
 
+// --- ALERTAS DE LEITURA ANTIGA ---
+// Máquinas cuja última leitura (movimentação/coleta) foi feita há mais de N
+// dias — mesmo padrão de alertasEstoque, reaproveitando a mesma query batched
+// de última movimentação por máquina.
+export const alertasLeituraAntiga = async (req, res) => {
+  try {
+    const { lojaId } = req.query;
+    const diasLimite = parseInt(req.query.dias, 10) || 15;
+    const whereMaquina = { ativo: true };
+
+    if (lojaId) {
+      whereMaquina.lojaId = lojaId;
+    }
+
+    const maquinas = await Maquina.findAll({
+      where: whereMaquina,
+      include: [
+        {
+          model: Loja,
+          as: "loja",
+          attributes: ["id", "nome"],
+        },
+      ],
+    });
+
+    const ultimasMovimentacoesPorMaquina = await getUltimaMovimentacaoPorMaquina(
+      maquinas.map((m) => m.id),
+    );
+
+    const MS_DIA = 24 * 60 * 60 * 1000;
+    const hoje = new Date();
+
+    const alertas = maquinas
+      .map((maquina) => {
+        const ultimaMovimentacao = ultimasMovimentacoesPorMaquina.get(maquina.id);
+        const ultimaLeitura = ultimaMovimentacao?.dataColeta || null;
+        const diasSemLeitura = ultimaLeitura
+          ? Math.floor((hoje - new Date(ultimaLeitura)) / MS_DIA)
+          : 9999;
+
+        return {
+          maquina: {
+            id: maquina.id,
+            codigo: maquina.codigo,
+            nome: maquina.nome,
+            loja: maquina.loja?.nome,
+          },
+          ultimaLeitura,
+          diasSemLeitura,
+        };
+      })
+      .filter((item) => item.diasSemLeitura > diasLimite)
+      .sort((a, b) => b.diasSemLeitura - a.diasSemLeitura);
+
+    res.json({
+      totalAlertas: alertas.length,
+      alertas,
+    });
+  } catch (error) {
+    console.error("Erro ao buscar alertas de leitura antiga:", error);
+    res.status(500).json({ error: "Erro ao buscar alertas de leitura antiga" });
+  }
+};
+
 // --- PERFORMANCE MÁQUINAS ---
 export const performanceMaquinas = async (req, res) => {
   try {
