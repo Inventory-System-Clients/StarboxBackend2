@@ -4,6 +4,7 @@ import {
   Maquina,
   FluxoCaixa,
   BaseSecundariaDashboard,
+  ValorEsperadoMovimentacao,
 } from "../models/index.js";
 
 // Renda bruta diária consolidada de todas as lojas para o mês informado
@@ -100,6 +101,79 @@ export const lucroDiario = async (req, res) => {
   } catch (error) {
     console.error("[dashboard.lucroDiario] Erro:", error);
     res.status(500).json({ error: "Erro ao gerar renda bruta diária consolidada" });
+  }
+};
+
+// Valor esperado diário consolidado de todas as lojas para o mês informado —
+// soma da ValorEsperadoMovimentacao (valor calculado pelos contadores da
+// máquina na retirada de dinheiro, usado na conferência de FluxoCaixa), não
+// o faturamento realmente reportado. Mesmo formato de resposta de
+// lucroDiario pra o frontend reaproveitar a mesma lógica de acumulação.
+export const valorEsperadoDiario = async (req, res) => {
+  try {
+    const paraNumero = (valor) => {
+      const numero = Number(valor);
+      return Number.isFinite(numero) ? numero : 0;
+    };
+
+    const pad2 = (valor) => String(valor).padStart(2, "0");
+    const formatarDataLocal = (data) =>
+      `${data.getFullYear()}-${pad2(data.getMonth() + 1)}-${pad2(data.getDate())}`;
+
+    const arredondar2 = (valor) => Number(paraNumero(valor).toFixed(2));
+
+    const { ano: anoQuery, mes: mesQuery } = req.query;
+    const hoje = new Date();
+
+    const ano = Number(anoQuery ?? hoje.getFullYear());
+    const mes = Number(mesQuery ?? hoje.getMonth() + 1);
+
+    if (!Number.isInteger(ano) || ano < 2000 || ano > 2100) {
+      return res.status(400).json({ error: "Parâmetro ano inválido" });
+    }
+
+    if (!Number.isInteger(mes) || mes < 1 || mes > 12) {
+      return res.status(400).json({ error: "Parâmetro mes inválido" });
+    }
+
+    const mesIndex = mes - 1;
+    const inicioMes = new Date(ano, mesIndex, 1, 0, 0, 0, 0);
+    const fimMes = new Date(ano, mesIndex + 1, 0, 23, 59, 59, 999);
+
+    const resultado = {};
+    for (
+      let data = new Date(inicioMes);
+      data <= fimMes;
+      data = new Date(data.getFullYear(), data.getMonth(), data.getDate() + 1)
+    ) {
+      resultado[formatarDataLocal(data)] = 0;
+    }
+
+    const registros = await ValorEsperadoMovimentacao.findAll({
+      where: { dataColeta: { [Op.between]: [inicioMes, fimMes] } },
+      attributes: ["valorEsperado", "dataColeta"],
+    });
+
+    for (const registro of registros) {
+      const dataRegistro = registro?.dataColeta
+        ? new Date(registro.dataColeta)
+        : null;
+      if (!dataRegistro) continue;
+      const chave = formatarDataLocal(dataRegistro);
+      if (!(chave in resultado)) continue;
+      resultado[chave] += paraNumero(registro.valorEsperado);
+    }
+
+    for (const chave of Object.keys(resultado)) {
+      resultado[chave] = arredondar2(resultado[chave]);
+    }
+
+    res.json(resultado);
+  } catch (error) {
+    console.error("[dashboard.valorEsperadoDiario] Erro:", error);
+    res
+      .status(500)
+      .json({ error: "Erro ao gerar valor esperado diário consolidado" });
   }
 };
 

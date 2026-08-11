@@ -1,6 +1,7 @@
 import express from "express";
 import {
   lucroDiario,
+  valorEsperadoDiario,
   faturamentoSemanal,
   comparacaoLucro,
   listarBasesSecundariasDashboard,
@@ -14,6 +15,9 @@ const router = express.Router();
 
 // GET /dashboard/lucro-diario?ano=2026&mes=3
 router.get("/lucro-diario", autenticar, lucroDiario);
+
+// GET /dashboard/valor-esperado-diario?ano=2026&mes=3
+router.get("/valor-esperado-diario", autenticar, valorEsperadoDiario);
 
 // GET /dashboard/faturamento-semanal?lojaId=...
 router.get("/faturamento-semanal", autenticar, faturamentoSemanal);
