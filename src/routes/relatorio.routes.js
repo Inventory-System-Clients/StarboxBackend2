@@ -5,6 +5,7 @@ import {
   alertasEstoque,
   alertasLeituraAntiga,
   performanceMaquinas,
+  resumoMaquinasLoja,
   relatorioImpressao,
   relatorioImpressaoLote,
   relatorioTodasLojas,
@@ -63,6 +64,9 @@ router.get(
   autorizar("ADMIN"),
   performanceMaquinas,
 );
+// Sem restrição de ADMIN: alimenta o card de cada máquina na tela de
+// detalhes do ponto, que já é acessível a qualquer usuário autenticado.
+router.get("/resumo-maquinas", autenticar, resumoMaquinasLoja);
 router.get("/impressao", autenticar, autorizar("ADMIN"), relatorioImpressao);
 router.get(
   "/impressao-lote",

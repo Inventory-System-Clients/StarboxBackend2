@@ -1594,6 +1594,142 @@ export const performanceMaquinas = async (req, res) => {
   }
 };
 
+// --- RESUMO DE MÁQUINAS DO PONTO (valor esperado, última leitura, média por
+// pelúcia) --- Alimenta o card de cada máquina na tela de detalhes do ponto.
+// Sem autorizar("ADMIN") de propósito: essa tela já é acessível a qualquer
+// usuário autenticado, mesmo padrão de /maquinas/:id/estoque.
+export const resumoMaquinasLoja = async (req, res) => {
+  try {
+    const { lojaId, dataInicio, dataFim } = req.query;
+
+    if (!lojaId) {
+      return res.status(400).json({ error: "lojaId é obrigatório" });
+    }
+
+    const fim = dataFim ? new Date(`${dataFim}T23:59:59.999`) : new Date();
+    const inicio = dataInicio
+      ? new Date(`${dataInicio}T00:00:00`)
+      : new Date(fim.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    const maquinas = await Maquina.findAll({
+      where: { lojaId },
+      attributes: ["id", "codigo", "nome", "valorFicha", "usaFichas"],
+    });
+
+    if (maquinas.length === 0) {
+      return res.json({
+        periodo: { inicio: inicio.toISOString(), fim: fim.toISOString() },
+        resumo: [],
+      });
+    }
+
+    const maquinaIds = maquinas.map((m) => m.id);
+
+    const [movimentacoes, valoresEsperados, ultimasMovimentacoesPorMaquina] =
+      await Promise.all([
+        Movimentacao.findAll({
+          where: {
+            dataColeta: { [Op.between]: [inicio, fim] },
+            retiradaEstoque: false,
+          },
+          include: [
+            {
+              model: Maquina,
+              as: "maquina",
+              where: { id: { [Op.in]: maquinaIds } },
+              attributes: ["id", "valorFicha", "usaFichas"],
+            },
+          ],
+        }),
+        ValorEsperadoMovimentacao.findAll({
+          where: {
+            maquinaId: { [Op.in]: maquinaIds },
+            dataColeta: { [Op.between]: [inicio, fim] },
+          },
+          attributes: ["maquinaId", "valorEsperado"],
+        }),
+        getUltimaMovimentacaoPorMaquina(maquinaIds),
+      ]);
+
+    const agregadoPorMaquina = {};
+    for (const maquinaId of maquinaIds) {
+      agregadoPorMaquina[maquinaId] = {
+        totalFichas: 0,
+        totalSairam: 0,
+        totalFaturamento: 0,
+        totalMovimentacoes: 0,
+        valorEsperadoPeriodo: 0,
+      };
+    }
+
+    for (const mov of movimentacoes) {
+      const maquinaId = mov.maquina?.id;
+      if (!maquinaId || !agregadoPorMaquina[maquinaId]) continue;
+      const e = agregadoPorMaquina[maquinaId];
+      const fqtd = parseInt(mov.fichas) || 0;
+      const vf = parseFloat(mov.maquina?.valorFicha || 0);
+      e.totalMovimentacoes += 1;
+      e.totalFichas += fqtd;
+      e.totalSairam += parseInt(mov.sairam) || 0;
+      e.totalFaturamento +=
+        fqtd * vf +
+        parseFloat(mov.quantidade_notas_entrada || 0) +
+        parseFloat(mov.valor_entrada_maquininha_pix || 0);
+    }
+
+    for (const registro of valoresEsperados) {
+      const maquinaId = registro.maquinaId;
+      if (!agregadoPorMaquina[maquinaId]) continue;
+      agregadoPorMaquina[maquinaId].valorEsperadoPeriodo += Number(
+        registro.valorEsperado || 0,
+      );
+    }
+
+    const MS_DIA = 24 * 60 * 60 * 1000;
+    const hoje = new Date();
+
+    const resumo = maquinas.map((maquina) => {
+      const e = agregadoPorMaquina[maquina.id];
+      const usaFichas = maquina.usaFichas === true || maquina.usaFichas === 1;
+      const valorFicha = Number(maquina.valorFicha || 0);
+
+      const mediaRPorPelucia =
+        usaFichas && e.totalSairam > 0
+          ? Number(((e.totalFichas * valorFicha) / e.totalSairam).toFixed(2))
+          : null;
+
+      const ultimaMovimentacao = ultimasMovimentacoesPorMaquina.get(maquina.id);
+      const ultimaLeitura = ultimaMovimentacao?.dataColeta || null;
+      const diasSemLeitura = ultimaLeitura
+        ? Math.floor((hoje - new Date(ultimaLeitura)) / MS_DIA)
+        : 9999;
+
+      return {
+        maquinaId: maquina.id,
+        maquinaCodigo: maquina.codigo,
+        maquinaNome: maquina.nome,
+        valorEsperadoPeriodo: Number(e.valorEsperadoPeriodo.toFixed(2)),
+        totalSairamPeriodo: e.totalSairam,
+        totalFaturamentoPeriodo: Number(e.totalFaturamento.toFixed(2)),
+        totalMovimentacoesPeriodo: e.totalMovimentacoes,
+        mediaRPorPelucia,
+        ultimaLeitura,
+        diasSemLeitura,
+      };
+    });
+
+    res.json({
+      periodo: { inicio: inicio.toISOString(), fim: fim.toISOString() },
+      resumo,
+    });
+  } catch (error) {
+    console.error("Erro ao gerar resumo de máquinas do ponto:", error);
+    res
+      .status(500)
+      .json({ error: "Erro ao gerar resumo de máquinas do ponto" });
+  }
+};
+
 // --- RELATÓRIO DE IMPRESSÃO (RESTAURADO E CORRIGIDO) ---
 const obterRelatorioImpressaoInterno = async ({
   lojaId,

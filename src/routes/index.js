@@ -15,6 +15,7 @@ import veiculoRoutes from "./veiculo.routes.js";
 import alertasVeiculosRoutes from "./alertasVeiculos.routes.js";
 import movimentacaoVeiculoRoutes from "./movimentacaoVeiculo.routes.js";
 import revisaoVeiculoRoutes from "./revisaoVeiculo.routes.js";
+import alertaMediaFichasRoutes from "./alertaMediaFichas.routes.js";
 import roteirosRoutes from "./roteiros.routes.js";
 import statusDiarioRoutes from "./statusDiario.routes.js";
 import financeiroRoutes from "./financeiro/index.js";
@@ -55,6 +56,7 @@ router.use("/alertas-veiculos", alertasVeiculosRoutes);
 
 router.use("/movimentacao-veiculos", movimentacaoVeiculoRoutes);
 router.use("/revisoes-veiculos", revisaoVeiculoRoutes);
+router.use("/alertas-media-jogadas", alertaMediaFichasRoutes);
 
 router.use("/roteiros", roteirosRoutes);
 router.use("/status-diario", statusDiarioRoutes);

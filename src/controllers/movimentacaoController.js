@@ -22,6 +22,7 @@ import { randomUUID } from "node:crypto";
 import { registrarMovimentacaoPecas } from "./movimentacaoPecaController.js";
 import justificativasPendentes from "../utils/justificativasPendentes.js";
 import AlertManager from "../services/alertManager.js";
+import { verificarMediaJogadasForaPadrao } from "../services/alertaMediaFichasService.js";
 import { calcularEsperadoMovimentacaoRetirada } from "../services/fluxoCaixaCalculoService.js";
 import { registrarMaquinaConcluidaNaExecucao } from "../utils/roteiroStatusSemanal.js";
 import { resolverContextoExecucaoSemanal } from "../utils/roteiroExecucaoSemanal.js";
@@ -1068,6 +1069,29 @@ export const registrarMovimentacao = async (req, res) => {
         requestId,
         etapa: "pos-processamento",
         bloco: "alertas_estoque",
+        erro: erroSecundario.message,
+      });
+    }
+
+    try {
+      await verificarMediaJogadasForaPadrao({
+        movimentacao,
+        maquina,
+        contadorInAnterior: isPrimeiraMovimentacao
+          ? contadorInAnteriorSanitizado
+          : ultimaMov?.contadorIn,
+        contadorOutAnterior: isPrimeiraMovimentacao
+          ? contadorOutAnteriorSanitizado
+          : ultimaMov?.contadorOut,
+        usuario: req.usuario,
+      });
+    } catch (erroSecundario) {
+      warnings.push("Falha ao verificar média de jogadas por pelúcia");
+      logMovimentacao("warn", {
+        evento: "movimentacao_pos_processamento_erro",
+        requestId,
+        etapa: "pos-processamento",
+        bloco: "media_jogadas_pelucia",
         erro: erroSecundario.message,
       });
     }
