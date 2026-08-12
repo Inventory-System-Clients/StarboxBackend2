@@ -248,10 +248,50 @@ export const listarMovimentacoesEstoqueUsuario = async (req, res) => {
       });
     }
 
-    const { usuarioId, dataInicio, dataFim } = req.query;
+    const { usuarioId, dataInicio, dataFim, limit } = req.query;
 
-    // Regra do front: sem filtros completos nao deve aparecer nada.
-    if (!usuarioId || !dataInicio || !dataFim) {
+    if (!usuarioId) {
+      return res.json([]);
+    }
+
+    // Modo "últimas N movimentações" — usado pelo mini-histórico no card do
+    // usuário, sem exigir filtro de data. Sem `limit`, mantém a regra do
+    // front original: sem dataInicio/dataFim completos nao deve aparecer nada.
+    const limiteNumerico = Math.min(Math.max(parseInt(limit, 10) || 0, 0), 50);
+
+    if ((!dataInicio || !dataFim) && limiteNumerico > 0) {
+      const usuarioParaLimite = await buscarUsuario(usuarioId);
+      if (!usuarioParaLimite) {
+        return res.status(404).json({ error: "Usuario nao encontrado" });
+      }
+
+      const movimentacoesRecentes = await MovimentacaoEstoqueUsuario.findAll({
+        where: { usuarioId },
+        include: [
+          {
+            model: Usuario,
+            as: "usuario",
+            attributes: ["id", "nome", "email", "role"],
+          },
+          {
+            model: Usuario,
+            as: "lancadoPor",
+            attributes: ["id", "nome", "email", "role"],
+          },
+          {
+            model: Produto,
+            as: "produto",
+            attributes: ["id", "nome", "codigo", "emoji"],
+          },
+        ],
+        order: [["dataMovimentacao", "DESC"]],
+        limit: limiteNumerico,
+      });
+
+      return res.json(movimentacoesRecentes);
+    }
+
+    if (!dataInicio || !dataFim) {
       return res.json([]);
     }
 
@@ -491,6 +531,7 @@ export const atualizarVariosEstoquesUsuario = async (req, res) => {
 
     const resultados = [];
     const erros = [];
+    const registrosHistorico = [];
 
     for (const item of estoques) {
       const { produtoId, quantidade, estoqueMinimo } = item || {};
@@ -532,12 +573,31 @@ export const atualizarVariosEstoquesUsuario = async (req, res) => {
         },
       });
 
+      const quantidadeAnterior = created ? 0 : Number(estoque.quantidade);
+      const quantidadeAtual = Number(quantidade);
+
       if (!created) {
-        estoque.quantidade = Number(quantidade);
+        estoque.quantidade = quantidadeAtual;
         if (estoqueMinimo !== undefined) {
           estoque.estoqueMinimo = estoqueMinimoNumerico;
         }
         await estoque.save();
+      }
+
+      // Cada "Salvar estoque" que muda uma quantidade vira um registro de
+      // histórico automaticamente — não depende mais do modal de "Lançar
+      // movimentação" (removido do frontend).
+      if (quantidadeAtual !== quantidadeAnterior) {
+        registrosHistorico.push({
+          usuarioId,
+          lancadoPorId: req.usuario.id,
+          produtoId,
+          tipoMovimentacao:
+            quantidadeAtual > quantidadeAnterior ? "entrada" : "saida",
+          quantidade: Math.abs(quantidadeAtual - quantidadeAnterior),
+          quantidadeAnterior,
+          quantidadeAtual,
+        });
       }
 
       resultados.push({
@@ -547,6 +607,10 @@ export const atualizarVariosEstoquesUsuario = async (req, res) => {
         quantidade: estoque.quantidade,
         estoqueMinimo: estoque.estoqueMinimo,
       });
+    }
+
+    if (registrosHistorico.length > 0) {
+      await MovimentacaoEstoqueUsuario.bulkCreate(registrosHistorico);
     }
 
     return res.json({
