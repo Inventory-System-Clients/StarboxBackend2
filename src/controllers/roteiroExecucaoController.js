@@ -709,6 +709,7 @@ async function getTodosRoteirosComStatus(req, res) {
         funcionarioId: roteiro.funcionarioId,
         funcionarioNome: roteiro.funcionarioNome,
         funcionarioAbastecedor,
+        permiteGastos: roteiro.permiteGastos !== false,
         veiculoId: roteiro.veiculoId ?? null,
         veiculo: roteiro.veiculo
           ? {
