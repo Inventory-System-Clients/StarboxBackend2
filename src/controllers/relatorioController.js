@@ -2477,6 +2477,30 @@ const montarRelatorioDeUmaLoja = async ({
       (a, b) => b.quantidade - a.quantidade,
     );
 
+    // Valor esperado (contador): buscado uma única vez pra todas as
+    // movimentações da loja, e agrupado por máquina — usado tanto no total
+    // da loja (mais abaixo) quanto no "lucro esperado" de cada máquina.
+    const movimentacaoIdsRelatorioLoja = movimentacoes
+      .map((mov) => mov?.id)
+      .filter(Boolean);
+
+    const valoresEsperadosRelatorioLoja = movimentacaoIdsRelatorioLoja.length
+      ? await ValorEsperadoMovimentacao.findAll({
+          where: {
+            movimentacaoId: { [Op.in]: movimentacaoIdsRelatorioLoja },
+          },
+          attributes: ["maquinaId", "valorEsperado"],
+        })
+      : [];
+
+    const valorEsperadoPorMaquina = {};
+    for (const registro of valoresEsperadosRelatorioLoja) {
+      const chave = String(registro.maquinaId);
+      valorEsperadoPorMaquina[chave] =
+        (valorEsperadoPorMaquina[chave] || 0) +
+        paraNumero(registro.valorEsperado);
+    }
+
     // Formatar dados por máquina, incluindo valores de dinheiro/cartão/pix
     const maquinasDetalhadas = Object.values(dadosPorMaquina).map((m) => {
       const dinheiroMaquina = Number(m.dinheiroMovimentacoes || 0);
@@ -2518,6 +2542,17 @@ const montarRelatorioDeUmaLoja = async ({
           ? faturamentoBrutoMaquina / Number(totalSairamMaquina || 0)
           : 0;
 
+      const valorEsperadoMaquina = arredondar2(
+        valorEsperadoPorMaquina[String(m.maquina.id)] || 0,
+      );
+      // Lucro esperado: usa o valor esperado pelo contador (em vez do
+      // faturamento realmente conferido) menos o custo dos produtos que
+      // saíram — mesma lógica do "lucro esperado" da rota/relatório, só que
+      // por máquina.
+      const lucroEsperadoMaquina = arredondar2(
+        valorEsperadoMaquina - custoProdutosSairamMaquina,
+      );
+
       return {
         maquina: m.maquina,
         totais: {
@@ -2530,6 +2565,8 @@ const montarRelatorioDeUmaLoja = async ({
           cartaoPix: cartaoPixMaquina,
           faturamentoBruto: Number(faturamentoBrutoMaquina.toFixed(2)),
           ticketPorPremio: Number(ticketPorPremioMaquina.toFixed(2)),
+          valorEsperado: valorEsperadoMaquina,
+          lucroEsperado: lucroEsperadoMaquina,
         },
         produtosSairam: produtosSairamMaquina,
         produtosEntraram: Object.values(m.produtosEntraram)
@@ -2585,23 +2622,14 @@ const montarRelatorioDeUmaLoja = async ({
       0,
     );
 
-    // Valor esperado: soma diretamente da tabela valor_esperado_movimentacao
-    // filtrando pelas movimentações já carregadas neste relatório.
-    const movimentacaoIdsNoRelatorio = movimentacoes
-      .map((mov) => mov?.id)
-      .filter(Boolean);
-
-    const valorEsperadoSomado = movimentacaoIdsNoRelatorio.length
-      ? await ValorEsperadoMovimentacao.sum("valorEsperado", {
-          where: {
-            movimentacaoId: {
-              [Op.in]: movimentacaoIdsNoRelatorio,
-            },
-          },
-        })
-      : 0;
-
-    const valorEsperadoContadores = arredondar2(valorEsperadoSomado || 0);
+    // Valor esperado da loja: soma dos valores esperados por máquina já
+    // buscados acima (evita repetir a mesma consulta).
+    const valorEsperadoContadores = arredondar2(
+      Object.values(valorEsperadoPorMaquina).reduce(
+        (acc, valor) => acc + paraNumero(valor),
+        0,
+      ),
+    );
 
     const faturamentoBrutoConsolidado =
       Number(valorTotalLoja || 0) + Number(faturamentoBrutoMaquinas || 0);
