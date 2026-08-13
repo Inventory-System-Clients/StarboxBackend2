@@ -38,7 +38,6 @@ export async function verificarMediaJogadasForaPadrao({
   contadorOutAnterior,
   usuario,
 }) {
-  if (!movimentacao?.retiradaDinheiro) return null;
   if (!maquina || !ehUsaFichas(maquina)) return null;
 
   const valorFicha = Number(maquina.valorFicha || 0);
