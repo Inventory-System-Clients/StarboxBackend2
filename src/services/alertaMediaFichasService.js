@@ -16,12 +16,6 @@ const REFERENCIA_TIPO = "maquina";
 
 const arredondar2 = (valor) => Math.round(Number(valor || 0) * 100) / 100;
 
-const ehUsaFichas = (maquina) =>
-  maquina?.usaFichas === true ||
-  maquina?.usa_fichas === true ||
-  maquina?.usaFichas === 1 ||
-  maquina?.usa_fichas === 1;
-
 /**
  * Verifica se a leitura recém-registrada está fora da faixa esperada de
  * "jogadas médias por pelúcia" pro valor de ficha da máquina, e mantém o
@@ -38,7 +32,7 @@ export async function verificarMediaJogadasForaPadrao({
   contadorOutAnterior,
   usuario,
 }) {
-  if (!maquina || !ehUsaFichas(maquina)) return null;
+  if (!maquina) return null;
 
   const valorFicha = Number(maquina.valorFicha || 0);
   const faixa = FAIXAS_MEDIA_POR_VALOR_FICHA[valorFicha];
