@@ -25,6 +25,7 @@ import {
   garantirFuncionarioPersistenteRoteiro,
   hasFuncionarioPayload,
   resolverAtualizacaoFuncionarioRoteiro,
+  sincronizarPermissoesLojasRoteiro,
 } from "../services/roteiroFuncionarioService.js";
 import {
   finalizarRoteiro,
@@ -370,6 +371,9 @@ router.post(
         funcionarioNome: result.funcionarioNome,
         veiculoId: result.veiculoId,
       });
+      if (update.funcionarioId) {
+        await sincronizarPermissoesLojasRoteiro(roteiro.id);
+      }
 
       if (execucaoExistente?.emAndamento) {
         const updateExecucao = {};
@@ -597,6 +601,10 @@ router.post(
             criado?.LojaId,
           );
         }
+
+        await sincronizarPermissoesLojasRoteiro(roteiroDestinoId, {
+          transaction: t,
+        });
       });
 
       console.log("[MOVER-LOJA] sucesso");
@@ -1041,6 +1049,8 @@ router.patch(
         ) {
           await execucaoAtiva.update({ usuarioId: update.funcionarioId });
         }
+
+        await sincronizarPermissoesLojasRoteiro(roteiro.id);
       }
 
       res.json(roteiro);

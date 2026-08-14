@@ -1429,6 +1429,46 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       createdAt: mov.dataColeta,
     }));
 
+    // Maquinas da loja sem leitura dentro da janela da execucao atual (ex.: o
+    // PATCH de resumo-whatsapp falhou, ou a leitura ficou fora do corte de
+    // dataColeta). Para essas, busca a ultima movimentacao com resumo salvo,
+    // independente da data, e monta a mensagem com ela mesmo assim.
+    const maquinaIdsComLeitura = new Set(itens.map((item) => String(item.maquinaId)));
+    const maquinasDaLoja = await Maquina.findAll({
+      where: { lojaId },
+      attributes: ["id", "nome", "codigo"],
+    });
+    const maquinasSemLeitura = maquinasDaLoja.filter(
+      (maquina) => !maquinaIdsComLeitura.has(String(maquina.id)),
+    );
+
+    if (maquinasSemLeitura.length > 0) {
+      const ultimasLeituras = await Promise.all(
+        maquinasSemLeitura.map((maquina) =>
+          Movimentacao.findOne({
+            where: { maquinaId: maquina.id, resumoWhatsapp: { [Op.ne]: null } },
+            order: [["dataColeta", "DESC"]],
+          }),
+        ),
+      );
+
+      ultimasLeituras.forEach((mov, index) => {
+        if (!mov) return;
+        const maquina = maquinasSemLeitura[index];
+        itens.push({
+          id: mov.id,
+          maquinaId: mov.maquinaId,
+          maquinaNome: maquina?.nome || maquina?.codigo || mov.maquinaId,
+          resumo: mov.resumoWhatsapp,
+          createdAt: mov.dataColeta,
+        });
+      });
+
+      itens.sort(
+        (a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0),
+      );
+    }
+
     res.json(itens);
   } catch (error) {
     console.error("Erro ao listar leituras de WhatsApp da loja:", error);

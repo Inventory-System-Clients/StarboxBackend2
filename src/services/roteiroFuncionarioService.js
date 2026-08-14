@@ -1,4 +1,10 @@
-import { Usuario, RoteiroExecucaoSemanal } from "../models/index.js";
+import {
+  Usuario,
+  Roteiro,
+  RoteiroExecucaoSemanal,
+  RoteiroLoja,
+  UsuarioLoja,
+} from "../models/index.js";
 
 const ROLE_ABASTECEDOR = "ABASTECEDOR";
 
@@ -7,6 +13,11 @@ const ROLES_FUNCIONARIO_ROTEIRO = new Set([
   "FUNCIONARIO_TODAS_LOJAS",
   ROLE_ABASTECEDOR,
 ]);
+
+// Mesmas roles que o cadastro de usuario usa para exigir UsuarioLoja antes de
+// registrar movimentacao (ver movimentacaoController). FUNCIONARIO_TODAS_LOJAS
+// nao entra aqui porque essa role ja acessa qualquer loja sem essa checagem.
+const ROLES_COM_PERMISSAO_POR_LOJA = new Set(["FUNCIONARIO", ROLE_ABASTECEDOR]);
 
 const ROLES_RESPONSAVEL_ROTEIRO = new Set([
   "ADMIN",
@@ -97,7 +108,60 @@ export const garantirFuncionarioPersistenteRoteiro = async (
 
   roteiro.funcionarioId = funcionario.id;
   roteiro.funcionarioNome = funcionario.nome;
+
+  await sincronizarPermissoesLojasRoteiro(roteiro.id, { transaction });
+
   return roteiro;
+};
+
+// Garante que o funcionario/abastecedor responsavel por um roteiro tenha
+// UsuarioLoja (registrarMovimentacao) para todas as lojas do roteiro. Sem
+// isso, a loja aparece na rota do usuario mas ele leva "sem acesso para
+// registrar movimentacoes nesta loja" - essas duas listas (lojas do roteiro
+// e lojas permitidas do usuario) sao independentes e so ficavam em sincronia
+// se um admin lembrasse de atualizar as duas manualmente. Chamar sempre que
+// o funcionarioId do roteiro muda ou uma loja entra no roteiro.
+export const sincronizarPermissoesLojasRoteiro = async (
+  roteiroId,
+  { transaction } = {},
+) => {
+  if (!roteiroId) return;
+
+  const roteiro = await Roteiro.findByPk(roteiroId, {
+    attributes: ["id", "funcionarioId"],
+    transaction,
+  });
+  if (!roteiro?.funcionarioId) return;
+
+  const funcionario = await Usuario.findByPk(roteiro.funcionarioId, {
+    attributes: ["id", "role"],
+    transaction,
+  });
+  if (!funcionario || !ROLES_COM_PERMISSAO_POR_LOJA.has(funcionario.role)) {
+    return;
+  }
+
+  const lojasDoRoteiro = await RoteiroLoja.findAll({
+    where: { RoteiroId: roteiroId },
+    attributes: ["LojaId"],
+    transaction,
+  });
+
+  for (const { LojaId: lojaId } of lojasDoRoteiro) {
+    await UsuarioLoja.findOrCreate({
+      where: { usuarioId: funcionario.id, lojaId },
+      defaults: {
+        usuarioId: funcionario.id,
+        lojaId,
+        permissoes: {
+          visualizar: true,
+          editar: false,
+          registrarMovimentacao: true,
+        },
+      },
+      transaction,
+    });
+  }
 };
 
 // Roteiros cujo funcionario responsavel e ABASTECEDOR nao usam veiculo, gastos

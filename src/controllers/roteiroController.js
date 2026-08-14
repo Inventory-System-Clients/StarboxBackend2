@@ -40,6 +40,7 @@ import {
   garantirFuncionarioPersistenteRoteiro,
   resolverAtualizacaoFuncionarioRoteiro,
   roteiroTemFuncionarioAbastecedor,
+  sincronizarPermissoesLojasRoteiro,
 } from "../services/roteiroFuncionarioService.js";
 
 const DIAS_VALIDOS = ["SEG", "TER", "QUA", "QUI", "SEX", "SAB", "DOM"];
@@ -425,6 +426,9 @@ export const iniciarRoteiro = async (req, res) => {
     if (veiculoId !== undefined) update.veiculoId = veiculoIdNormalizado;
 
     await roteiro.update(update);
+    if (update.funcionarioId) {
+      await sincronizarPermissoesLojasRoteiro(roteiro.id);
+    }
 
     // Se já existe execução e está em andamento pelo mesmo usuário, apenas atualiza os campos
     if (execucaoExistente?.emAndamento) {
