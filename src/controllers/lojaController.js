@@ -5,7 +5,7 @@ import { parseListParams, buildPaginatedResponse } from "../utils/pagination.js"
 // US04 - Listar todas as lojas
 export const listarLojas = async (req, res) => {
   try {
-    const { busca, ativo, cidade, estado, roteiroId } = req.query;
+    const { busca, ativo, cidade, estado, roteiroId, maquinaId } = req.query;
     const params = parseListParams(req.query, { defaultPageSize: 20 });
 
     const where = {};
@@ -50,13 +50,22 @@ export const listarLojas = async (req, res) => {
         : { [Op.in]: idsDaRota };
     }
 
-    const include = [
-      {
-        model: Maquina,
-        as: "maquinas",
-        attributes: ["id", "codigo", "nome", "tipo", "ativo"],
-      },
-    ];
+    const includeMaquinas = {
+      model: Maquina,
+      as: "maquinas",
+      attributes: ["id", "codigo", "nome", "tipo", "ativo"],
+    };
+    if (maquinaId) {
+      const ehUuid =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+          maquinaId,
+        );
+      includeMaquinas.where = ehUuid
+        ? { [Op.or]: [{ id: maquinaId }, { codigo: { [Op.iLike]: `%${maquinaId}%` } }] }
+        : { codigo: { [Op.iLike]: `%${maquinaId}%` } };
+      includeMaquinas.required = true;
+    }
+    const include = [includeMaquinas];
     const order = [["nome", "ASC"]];
 
     if (params.all) {
