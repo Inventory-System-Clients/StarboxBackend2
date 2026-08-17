@@ -2499,17 +2499,26 @@ const montarRelatorioDeUmaLoja = async ({
           where: {
             movimentacaoId: { [Op.in]: movimentacaoIdsRelatorioLoja },
           },
-          attributes: ["maquinaId", "valorEsperado"],
+          attributes: ["movimentacaoId", "maquinaId", "valorEsperado"],
         })
       : [];
 
     const valorEsperadoPorMaquina = {};
+    const valorEsperadoPorMovimentacao = {};
     for (const registro of valoresEsperadosRelatorioLoja) {
       const chave = String(registro.maquinaId);
       valorEsperadoPorMaquina[chave] =
         (valorEsperadoPorMaquina[chave] || 0) +
         paraNumero(registro.valorEsperado);
+      valorEsperadoPorMovimentacao[String(registro.movimentacaoId)] =
+        paraNumero(registro.valorEsperado);
     }
+
+    leituras.forEach((leitura) => {
+      leitura.valorEsperado = arredondar2(
+        valorEsperadoPorMovimentacao[String(leitura.movimentacaoId)] || 0,
+      );
+    });
 
     // Formatar dados por máquina, incluindo valores de dinheiro/cartão/pix
     const maquinasDetalhadas = Object.values(dadosPorMaquina).map((m) => {
