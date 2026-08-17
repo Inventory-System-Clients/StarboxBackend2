@@ -2291,6 +2291,7 @@ const montarRelatorioDeUmaLoja = async ({
     const produtosSairamMap = {};
     const produtosEntraramMap = {};
     const dadosPorMaquina = {};
+    const leituras = [];
 
     movimentacoes.forEach((mov) => {
       let quantidadeSaiuDetalhadaMov = 0;
@@ -2360,6 +2361,15 @@ const montarRelatorioDeUmaLoja = async ({
       dadosPorMaquina[maquinaId].cartaoPixMovimentacoes += cartaoPixMov;
       dadosPorMaquina[maquinaId].faturamentoBrutoMovimentacoes +=
         faturamentoBrutoMov;
+
+      leituras.push({
+        movimentacaoId: mov.id,
+        maquinaId,
+        maquinaCodigo: mov.maquina.codigo,
+        maquinaNome: mov.maquina.nome,
+        dataColeta: mov.dataColeta,
+        valor: arredondar2(faturamentoBrutoMov),
+      });
 
       mov.detalhesProdutos?.forEach((mp) => {
         if (mp.quantidadeSaiu > 0) {
@@ -2732,6 +2742,9 @@ const montarRelatorioDeUmaLoja = async ({
         custoUnitario: parseFloat(p.produto.custoUnitario || 0),
       })),
       maquinas: maquinasDetalhadas,
+      leituras: [...leituras].sort(
+        (a, b) => new Date(b.dataColeta) - new Date(a.dataColeta),
+      ),
       ticketPremio: {
         faturamentoBruto: Number(faturamentoBrutoBaseTicket.toFixed(2)),
         produtosSairam: Number(totalSairam || 0),
