@@ -1231,7 +1231,6 @@ export const listarMovimentacoes = async (req, res) => {
     const {
       lojaId,
       maquinaId,
-      roteiroId,
       apenasJustificativasNovas,
       dataInicio,
       dataFim,
@@ -1243,11 +1242,16 @@ export const listarMovimentacoes = async (req, res) => {
     );
     const where = {};
     if (maquinaId) where.maquinaId = maquinaId;
-    // Movimentacoes sem roteiroId (ex.: a movimentacao inicial criada no
-    // cadastro da maquina, que nunca recebe roteiroId) continuam servindo de
-    // base para qualquer roteiro - so exclui explicitamente movimentacoes de
-    // OUTRO roteiro.
-    if (roteiroId) where.roteiroId = { [Op.or]: [roteiroId, null] };
+    // roteiroId de query NÃO filtra aqui de propósito: uma mesma máquina
+    // pode ter sua última movimentação registrada em outro roteiro (ex.:
+    // roteiro de coleta de um funcionário) enquanto também está no roteiro
+    // de um abastecedor que só passa lá pra repor produto. Quem chama este
+    // endpoint pra achar a "última movimentação da máquina" (ver
+    // PainelAbastecedor) precisa da mais recente de verdade, não só a
+    // registrada dentro de um roteiro específico. A autorização de quem
+    // pode agir em cima dela é resolvida separadamente em
+    // registrarAbastecimentoExtra, olhando os roteiros que atendem a loja
+    // da máquina - não o roteiroId desta listagem.
     if (apenasJustificativasNovas === "true") {
       where.status_justificativa = "nova";
     }
@@ -2084,77 +2088,74 @@ export const registrarAbastecimentoExtra = async (req, res) => {
 
     let roteiro = null;
     let usuarioResponsavelId = null;
-    if (movimentacao.roteiroId) {
-      roteiro = await Roteiro.findByPk(movimentacao.roteiroId, {
+
+    if (isGestor) {
+      // Gestor tem acesso irrestrito; só resolve o roteiro da movimentação
+      // (se existir) pra contexto/log, sem exigir nada dele.
+      if (movimentacao.roteiroId) {
+        roteiro = await Roteiro.findByPk(movimentacao.roteiroId, {
+          attributes: ["id", "funcionarioId"],
+          transaction,
+        });
+      }
+    } else {
+      // A autorização não depende de qual roteiro registrou a última leitura
+      // dessa máquina (movimentacao.roteiroId) - a mesma loja pode aparecer
+      // em mais de um roteiro ao mesmo tempo (ex.: o roteiro de coleta de um
+      // funcionário, que faz a leitura com dinheiro, e o roteiro de um
+      // abastecedor que passa só pra repor produto). O que importa é: o
+      // usuário é responsável por ALGUM roteiro que atende essa loja?
+      const roteirosDaLoja = await Roteiro.findAll({
         attributes: ["id", "funcionarioId"],
+        include: [
+          {
+            model: Loja,
+            as: "lojas",
+            attributes: [],
+            where: { id: maquina.lojaId },
+            through: { attributes: [] },
+          },
+        ],
         transaction,
       });
+
+      for (const candidato of roteirosDaLoja) {
+        // O responsável "atual" é quem está com a execução semanal em
+        // andamento; se não houver execução em andamento (ou ela estiver
+        // desatualizada por causa de uma reatribuição), cai pro funcionário
+        // oficialmente atribuído ao roteiro agora.
+        const contextoExecucao = await resolverContextoExecucaoSemanal(
+          candidato.id,
+        );
+        const responsavelAtual =
+          contextoExecucao.emAndamento && contextoExecucao.execucao?.usuarioId
+            ? contextoExecucao.execucao.usuarioId
+            : candidato.funcionarioId;
+
+        const usuarioEhResponsavelAtual =
+          String(responsavelAtual || "") === String(req.usuario.id);
+        const usuarioEhFuncionarioAtualDoRoteiro =
+          Boolean(candidato.funcionarioId) &&
+          String(candidato.funcionarioId) === String(req.usuario.id);
+
+        if (usuarioEhResponsavelAtual || usuarioEhFuncionarioAtualDoRoteiro) {
+          roteiro = candidato;
+          usuarioResponsavelId = responsavelAtual;
+          break;
+        }
+      }
 
       if (!roteiro) {
-        return rejeitar(404, "Roteiro não encontrado", "roteiro não encontrado");
-      }
-
-      // O responsável "atual" é quem está com a execução semanal em andamento,
-      // não o funcionarioId estático do roteiro (que só muda se reenviado
-      // explicitamente e pode ficar apontando pra outra pessoa).
-      const contextoExecucao = await resolverContextoExecucaoSemanal(roteiro.id);
-      usuarioResponsavelId =
-        contextoExecucao.emAndamento && contextoExecucao.execucao?.usuarioId
-          ? contextoExecucao.execucao.usuarioId
-          : roteiro.funcionarioId;
-
-      const lojaNoRoteiro = await RoteiroLoja.findOne({
-        where: {
-          RoteiroId: roteiro.id,
-          LojaId: maquina.lojaId,
-        },
-        transaction,
-      });
-
-      if (!lojaNoRoteiro) {
         return rejeitar(
           403,
-          "A máquina não pertence a uma loja deste roteiro",
-          "loja da máquina não pertence ao roteiro",
-          { lojaId: maquina.lojaId, roteiroId: roteiro.id },
+          "Você não é o funcionário responsável por este roteiro",
+          "usuário não é responsável por nenhum roteiro que atende esta loja",
+          {
+            lojaId: maquina.lojaId,
+            movimentacaoRoteiroId: movimentacao.roteiroId || null,
+          },
         );
       }
-    } else if (!isGestor) {
-      return rejeitar(
-        403,
-        "Movimentação sem roteiro acessível para este usuário",
-        "movimentação não vinculada a roteiro",
-      );
-    }
-
-    // Além do responsável "atual" da execução semanal em andamento, também
-    // aceita o funcionário oficialmente atribuído ao roteiro agora
-    // (roteiro.funcionarioId). Isso cobre o caso em que o roteiro foi
-    // reatribuído para outra pessoa depois que a execução semanal já estava
-    // em andamento sob o funcionário anterior: sem isso, o novo responsável
-    // fica bloqueado até o próximo reset semanal mesmo sendo quem a tela já
-    // mostra como dono da rota (ver painel do abastecedor, que não passa
-    // por /roteiros/:id/iniciar antes de abastecer).
-    const usuarioEhResponsavelAtual =
-      String(usuarioResponsavelId || "") === String(req.usuario.id);
-    const usuarioEhFuncionarioAtualDoRoteiro =
-      Boolean(roteiro?.funcionarioId) &&
-      String(roteiro.funcionarioId) === String(req.usuario.id);
-
-    if (
-      !isGestor &&
-      !usuarioEhResponsavelAtual &&
-      !usuarioEhFuncionarioAtualDoRoteiro
-    ) {
-      return rejeitar(
-        403,
-        "Você não é o funcionário responsável por este roteiro",
-        "usuário não é o responsável pelo roteiro",
-        {
-          roteiroId: roteiro?.id || null,
-          usuarioResponsavelId: usuarioResponsavelId || null,
-        },
-      );
     }
 
     if (!isGestor && ["FUNCIONARIO", "ABASTECEDOR"].includes(role)) {
