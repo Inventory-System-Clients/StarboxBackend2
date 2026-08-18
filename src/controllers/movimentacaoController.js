@@ -1502,6 +1502,11 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
                   diferencaIn: 0,
                   jogado: 0,
                   jogadasMediasPorPelucia: 0,
+                  // O "Lançado por" da mensagem é sempre quem está mandando
+                  // agora (o abastecedor), não quem registrou a leitura com
+                  // contador que por acaso ficou salva na mesma movimentação
+                  // (ou veio do fallback de outro roteiro).
+                  nomeUsuario: req.usuario?.nome || item.resumo.nomeUsuario,
                 }
               : item.resumo,
         }))
