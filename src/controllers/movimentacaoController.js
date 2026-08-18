@@ -2121,9 +2121,24 @@ export const registrarAbastecimentoExtra = async (req, res) => {
       );
     }
 
+    // Além do responsável "atual" da execução semanal em andamento, também
+    // aceita o funcionário oficialmente atribuído ao roteiro agora
+    // (roteiro.funcionarioId). Isso cobre o caso em que o roteiro foi
+    // reatribuído para outra pessoa depois que a execução semanal já estava
+    // em andamento sob o funcionário anterior: sem isso, o novo responsável
+    // fica bloqueado até o próximo reset semanal mesmo sendo quem a tela já
+    // mostra como dono da rota (ver painel do abastecedor, que não passa
+    // por /roteiros/:id/iniciar antes de abastecer).
+    const usuarioEhResponsavelAtual =
+      String(usuarioResponsavelId || "") === String(req.usuario.id);
+    const usuarioEhFuncionarioAtualDoRoteiro =
+      Boolean(roteiro?.funcionarioId) &&
+      String(roteiro.funcionarioId) === String(req.usuario.id);
+
     if (
       !isGestor &&
-      String(usuarioResponsavelId || "") !== String(req.usuario.id)
+      !usuarioEhResponsavelAtual &&
+      !usuarioEhFuncionarioAtualDoRoteiro
     ) {
       return rejeitar(
         403,
