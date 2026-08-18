@@ -1231,6 +1231,7 @@ export const listarMovimentacoes = async (req, res) => {
     const {
       lojaId,
       maquinaId,
+      roteiroId,
       apenasJustificativasNovas,
       dataInicio,
       dataFim,
@@ -1242,6 +1243,7 @@ export const listarMovimentacoes = async (req, res) => {
     );
     const where = {};
     if (maquinaId) where.maquinaId = maquinaId;
+    if (roteiroId) where.roteiroId = roteiroId;
     if (apenasJustificativasNovas === "true") {
       where.status_justificativa = "nova";
     }
