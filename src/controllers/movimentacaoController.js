@@ -26,6 +26,7 @@ import { verificarMediaJogadasForaPadrao } from "../services/alertaMediaFichasSe
 import { calcularEsperadoMovimentacaoRetirada } from "../services/fluxoCaixaCalculoService.js";
 import { registrarMaquinaConcluidaNaExecucao } from "../utils/roteiroStatusSemanal.js";
 import { resolverContextoExecucaoSemanal } from "../utils/roteiroExecucaoSemanal.js";
+import { roteiroTemFuncionarioAbastecedor } from "../services/roteiroFuncionarioService.js";
 import { parseListParams, buildPaginatedResponse } from "../utils/pagination.js";
 
 const possuiNumero = (valor) =>
@@ -1411,6 +1412,18 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
         .json({ error: "roteiroId e lojaId são obrigatórios" });
     }
 
+    // Roteiro de abastecedor nunca deve render dinheiro na mensagem, mesmo
+    // quando o resumo encontrado (inclusive pelo fallback abaixo, que busca
+    // a ultima movimentacao com resumo salvo independente do roteiro) veio
+    // de uma leitura de verdade feita em OUTRO roteiro (o de coleta de um
+    // funcionario) na mesma loja/maquina.
+    const roteiroConsultado = await Roteiro.findByPk(roteiroId, {
+      attributes: ["id", "funcionarioId"],
+    });
+    const ehRoteiroAbastecedor = await roteiroTemFuncionarioAbastecedor(
+      roteiroConsultado,
+    );
+
     const contexto = await resolverContextoExecucaoSemanal(roteiroId);
     const inicioExecucao = new Date(`${contexto.dataInicio}T00:00:00.000Z`);
 
@@ -1479,7 +1492,22 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       );
     }
 
-    res.json(itens);
+    const itensFinal = ehRoteiroAbastecedor
+      ? itens.map((item) => ({
+          ...item,
+          resumo:
+            item.resumo && typeof item.resumo === "object"
+              ? {
+                  ...item.resumo,
+                  diferencaIn: 0,
+                  jogado: 0,
+                  jogadasMediasPorPelucia: 0,
+                }
+              : item.resumo,
+        }))
+      : itens;
+
+    res.json(itensFinal);
   } catch (error) {
     console.error("Erro ao listar leituras de WhatsApp da loja:", error);
     res.status(500).json({ error: "Erro ao listar leituras de WhatsApp" });
