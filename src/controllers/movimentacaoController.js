@@ -1243,7 +1243,11 @@ export const listarMovimentacoes = async (req, res) => {
     );
     const where = {};
     if (maquinaId) where.maquinaId = maquinaId;
-    if (roteiroId) where.roteiroId = roteiroId;
+    // Movimentacoes sem roteiroId (ex.: a movimentacao inicial criada no
+    // cadastro da maquina, que nunca recebe roteiroId) continuam servindo de
+    // base para qualquer roteiro - so exclui explicitamente movimentacoes de
+    // OUTRO roteiro.
+    if (roteiroId) where.roteiroId = { [Op.or]: [roteiroId, null] };
     if (apenasJustificativasNovas === "true") {
       where.status_justificativa = "nova";
     }
