@@ -1427,11 +1427,19 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
     const contexto = await resolverContextoExecucaoSemanal(roteiroId);
     const inicioExecucao = new Date(`${contexto.dataInicio}T00:00:00.000Z`);
 
+    // Usa updatedAt (não dataColeta) para achar/ordenar a leitura mais
+    // recente: abastecimento extra reaproveita a movimentação existente e so
+    // atualiza produto/quantidade + resumoWhatsapp, preservando dataColeta de
+    // proposito (esse campo alimenta relatorio financeiro). Ou seja,
+    // dataColeta pode continuar apontando pra ultima LEITURA DE CONTADOR real
+    // (as vezes de dias atras) mesmo depois de um resumoWhatsapp ser
+    // atualizado hoje - updatedAt e quem reflete de fato quando o resumo foi
+    // salvo/atualizado pela ultima vez.
     const movimentacoes = await Movimentacao.findAll({
       where: {
         roteiroId,
         resumoWhatsapp: { [Op.ne]: null },
-        dataColeta: { [Op.gte]: inicioExecucao },
+        updatedAt: { [Op.gte]: inicioExecucao },
       },
       include: [
         {
@@ -1441,7 +1449,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
           where: { lojaId },
         },
       ],
-      order: [["dataColeta", "ASC"]],
+      order: [["updatedAt", "ASC"]],
     });
 
     const itens = movimentacoes.map((mov) => ({
@@ -1449,12 +1457,12 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       maquinaId: mov.maquinaId,
       maquinaNome: mov.maquina?.nome || mov.maquina?.codigo || mov.maquinaId,
       resumo: mov.resumoWhatsapp,
-      createdAt: mov.dataColeta,
+      createdAt: mov.updatedAt,
     }));
 
     // Maquinas da loja sem leitura dentro da janela da execucao atual (ex.: o
     // PATCH de resumo-whatsapp falhou, ou a leitura ficou fora do corte de
-    // dataColeta). Para essas, busca a ultima movimentacao com resumo salvo,
+    // updatedAt). Para essas, busca a ultima movimentacao com resumo salvo,
     // independente da data, e monta a mensagem com ela mesmo assim.
     const maquinaIdsComLeitura = new Set(itens.map((item) => String(item.maquinaId)));
     const maquinasDaLoja = await Maquina.findAll({
@@ -1470,7 +1478,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
         maquinasSemLeitura.map((maquina) =>
           Movimentacao.findOne({
             where: { maquinaId: maquina.id, resumoWhatsapp: { [Op.ne]: null } },
-            order: [["dataColeta", "DESC"]],
+            order: [["updatedAt", "DESC"]],
           }),
         ),
       );
@@ -1483,7 +1491,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
           maquinaId: mov.maquinaId,
           maquinaNome: maquina?.nome || maquina?.codigo || mov.maquinaId,
           resumo: mov.resumoWhatsapp,
-          createdAt: mov.dataColeta,
+          createdAt: mov.updatedAt,
         });
       });
 
