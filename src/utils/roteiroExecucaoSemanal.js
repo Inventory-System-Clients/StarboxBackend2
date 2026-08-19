@@ -37,8 +37,12 @@ const getPartesSaoPaulo = (data = new Date()) => {
 
 const formatarData = (data) => data.toISOString().slice(0, 10);
 
-export const getDataHoje = () => {
-  const partes = getPartesSaoPaulo();
+// corteMs desloca o instante usado para calcular "hoje" - hoje usado só para
+// os roteiros de ABASTECEDOR, cujo "Pendente" só deve voltar à 1h (e não à
+// meia-noite). Nenhum outro chamador passa corteMs, então o comportamento
+// padrão (corte à meia-noite) fica inalterado.
+export const getDataHoje = (corteMs = 0) => {
+  const partes = getPartesSaoPaulo(new Date(Date.now() - corteMs));
   return `${partes.ano}-${String(partes.mes).padStart(2, "0")}-${String(partes.dia).padStart(2, "0")}`;
 };
 

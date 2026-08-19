@@ -29,6 +29,10 @@ import { resolverContextoExecucaoSemanal } from "../utils/roteiroExecucaoSemanal
 import { roteiroTemFuncionarioAbastecedor } from "../services/roteiroFuncionarioService.js";
 import { parseListParams, buildPaginatedResponse } from "../utils/pagination.js";
 
+// Corte diário usado só para o status "Pendente/Feito" do ABASTECEDOR: o dia
+// dele só vira à 1h, não à meia-noite (ver registrarAbastecimentoExtra).
+const UMA_HORA_MS = 60 * 60 * 1000;
+
 const possuiNumero = (valor) =>
   valor !== null &&
   valor !== undefined &&
@@ -2375,6 +2379,24 @@ export const registrarAbastecimentoExtra = async (req, res) => {
       origemEstoque,
       saldoFinal: saldoAtual - quantidadeExtra,
     });
+
+    // Marca a máquina como concluída no dia (mesmo status usado pela leitura
+    // completa) para que o "Pendente" some do painel do abastecedor assim que
+    // ele faz o abastecimento extra. Só o ABASTECEDOR usa o corte de 1h (o
+    // "Pendente" dele só deve voltar à 1h, não à meia-noite); os demais perfis
+    // que também podem chamar este endpoint mantêm o corte padrão (meia-noite).
+    try {
+      await registrarMaquinaConcluidaNaExecucao({
+        maquinaId: movimentacao.maquinaId,
+        roteiroId: roteiro?.id || movimentacao.roteiroId,
+        corteDiaMs: role === "ABASTECEDOR" ? UMA_HORA_MS : 0,
+      });
+    } catch (erroStatusDiario) {
+      console.warn("[abastecimento-extra] falha ao atualizar status diário", {
+        ...contextoLog,
+        erro: erroStatusDiario?.message || String(erroStatusDiario),
+      });
+    }
 
     return res.status(200).json(movimentacaoAtualizada);
   } catch (error) {

@@ -33,6 +33,10 @@ import {
   roteiroTemFuncionarioAbastecedor,
 } from "../services/roteiroFuncionarioService.js";
 
+// Corte diário usado só para o status "Pendente/Feito" de roteiros de
+// ABASTECEDOR: o dia dele só vira à 1h, não à meia-noite.
+const UMA_HORA_MS = 60 * 60 * 1000;
+
 const obterTotalEstoqueUsuario = async (usuarioId) => {
   if (!usuarioId) return null;
 
@@ -158,9 +162,23 @@ async function getRoteiroExecucaoComStatus(req, res) {
 
     await garantirFuncionarioPersistenteRoteiro(roteiro);
 
+    const funcionarioAbastecedor = await roteiroTemFuncionarioAbastecedor(roteiro);
+
     const contextoExecucao = await resolverContextoExecucaoSemanal(roteiro.id);
     const dataHoje = contextoExecucao.dataHoje;
-    const dataInicio = contextoExecucao.dataInicio;
+    // O "Pendente" das máquinas só reseta à 1h (e não à meia-noite) para
+    // roteiros de ABASTECEDOR - ver corteDiaMs abaixo. Para os demais
+    // roteiros/perfis o corte continua na meia-noite, sem mudança de
+    // comportamento. Só se aplica quando dataInicio ainda é "hoje" (sem
+    // execução semanal multi-dia em andamento já persistida).
+    const corteDiaMsStatusMaquinas =
+      funcionarioAbastecedor && contextoExecucao.dataInicio === dataHoje
+        ? UMA_HORA_MS
+        : 0;
+    const dataInicio =
+      corteDiaMsStatusMaquinas > 0
+        ? getDataHoje(corteDiaMsStatusMaquinas)
+        : contextoExecucao.dataInicio;
     const inicioDia = new Date(`${dataHoje}T00:00:00.000Z`);
     const fimDia = new Date(`${dataHoje}T23:59:59.999Z`);
     const faixaSemanaAtual = getFaixaSemanaAtualUtc();
@@ -216,6 +234,7 @@ async function getRoteiroExecucaoComStatus(req, res) {
       roteiroId: roteiro.id,
       dataInicio,
       maquinaIds: maquinaIdsRota,
+      corteDiaMs: corteDiaMsStatusMaquinas,
     });
 
     const logsQuebraOrdemHoje = await LogOrdemRoteiro.findAll({
@@ -383,7 +402,6 @@ async function getRoteiroExecucaoComStatus(req, res) {
       resumoPersistido,
     );
     const resumoExecucao = await serializarResumoExecucao(resumoPersistido);
-    const funcionarioAbastecedor = await roteiroTemFuncionarioAbastecedor(roteiro);
 
     res.json({
       id: roteiro.id,
@@ -563,6 +581,9 @@ async function getTodosRoteirosComStatus(req, res) {
       ],
     });
     const dataHoje = getDataHoje();
+    // Só usado para roteiros de ABASTECEDOR - o "Pendente" deles reseta à 1h,
+    // não à meia-noite (ver corteDiaMsStatusMaquinas mais abaixo).
+    const dataHojeAbastecedor = getDataHoje(UMA_HORA_MS);
     const roteiroIds = roteiros.map((roteiro) => roteiro.id);
     const execucoes = roteiroIds.length
       ? await RoteiroExecucaoSemanal.findAll({
@@ -655,14 +676,23 @@ async function getTodosRoteirosComStatus(req, res) {
       const maquinaIdsRota = lojasOrdenadas.flatMap((loja) =>
         deduplicarMaquinasRoteiro(loja.maquinas).map((maquina) => maquina.id),
       );
+      // Ver comentário em getRoteiroExecucaoComStatus: só roteiro de
+      // ABASTECEDOR (e só quando dataInicio ainda é "hoje") usa o corte à 1h.
+      const corteDiaMsStatusMaquinas =
+        funcionarioAbastecedor && contexto.dataInicio === dataHoje
+          ? UMA_HORA_MS
+          : 0;
+      const dataInicioStatusMaquinas =
+        corteDiaMsStatusMaquinas > 0 ? dataHojeAbastecedor : contexto.dataInicio;
       const {
         statusMaquinas: statusMaquinasRoteiro,
         movimentacoesConsideradas,
         maquinasConcluidas: maquinasFinalizadas,
       } = await obterStatusMaquinasConcluidasDaExecucao({
         roteiroId: roteiro.id,
-        dataInicio: contexto.dataInicio,
+        dataInicio: dataInicioStatusMaquinas,
         maquinaIds: maquinaIdsRota,
+        corteDiaMs: corteDiaMsStatusMaquinas,
       });
       let roteiroFinalizado = lojasOrdenadas.length > 0;
       let roteiroTemMaquinas = false;
