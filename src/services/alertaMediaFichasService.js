@@ -1,8 +1,8 @@
 import { WhatsAppAlerta } from "../models/index.js";
 
-// Faixa esperada de "jogadas médias por pelúcia" (R$ jogado por pelúcia
-// liberada) por valor de ficha da máquina. Só essas duas por enquanto —
-// máquinas com outro valor de ficha não geram esse alerta.
+// Faixa esperada de "jogadas médias por pelúcia" (quantas fichas jogadas
+// pra cada pelúcia liberada) por valor de ficha da máquina. Só essas duas
+// por enquanto — máquinas com outro valor de ficha não geram esse alerta.
 // Mantenha em sync com FAIXAS_MEDIA_POR_VALOR_FICHA em
 // frontend2/src/components/MovimentacaoMaquinaForm.jsx (usada pra dar o
 // aviso na hora, antes de salvar).
@@ -59,8 +59,7 @@ export async function verificarMediaJogadasForaPadrao({
   // não mexe em nenhum alerta existente.
   if (quantidadeSaiu <= 0) return null;
 
-  const saldo = diferencaIn * valorFicha;
-  const mediaCalculada = arredondar2(saldo / quantidadeSaiu);
+  const mediaCalculada = arredondar2(diferencaIn / quantidadeSaiu);
   const dentroDaFaixa =
     mediaCalculada >= faixa.min && mediaCalculada <= faixa.max;
 
@@ -105,7 +104,6 @@ export async function verificarMediaJogadasForaPadrao({
     valorFicha,
     diferencaIn,
     quantidadeSaiu,
-    saldo: arredondar2(saldo),
     mediaCalculada,
     faixaMin: faixa.min,
     faixaMax: faixa.max,
@@ -117,9 +115,9 @@ export async function verificarMediaJogadasForaPadrao({
 
   const mensagem =
     `Máquina ${maquina.codigo || maquina.id}: jogadas médias por pelúcia ` +
-    `fora da faixa esperada (R$${faixa.min.toFixed(2)} a R$${faixa.max.toFixed(2)} ` +
+    `fora da faixa esperada (${faixa.min.toFixed(2)} a ${faixa.max.toFixed(2)} ` +
     `pra ficha de R$${valorFicha.toFixed(2)}). Leitura atual: ` +
-    `R$${mediaCalculada.toFixed(2)} (${diferenca.toFixed(2)} ${direcao} do limite).`;
+    `${mediaCalculada.toFixed(2)} (${diferenca.toFixed(2)} ${direcao} do limite).`;
 
   if (alertaExistente) {
     await alertaExistente.update({ mensagem, metadata: metadataAtualizada });
