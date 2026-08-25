@@ -409,91 +409,11 @@ const startServer = async () => {
       console.log(`📍 http://localhost:${PORT}`);
       console.log(`🏥 Health check: http://localhost:${PORT}/health`);
 
-      // Agendar reset semanal dos roteiros (segunda 00:00 em horário de São Paulo)
-      iniciarResetRoteirosSemanal();
-
       // Agendar limpeza automática de dados antigos (diariamente às 3h da manhã)
       if (process.env.NODE_ENV === "production") {
         iniciarLimpezaAutomatica();
       }
     });
-
-    const getDataHoraSaoPaulo = () => {
-      const agora = new Date();
-      const formatter = new Intl.DateTimeFormat("pt-BR", {
-        timeZone: "America/Sao_Paulo",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        weekday: "short",
-        hour12: false,
-      });
-
-      const partes = formatter.formatToParts(agora);
-      const obter = (type) => partes.find((parte) => parte.type === type)?.value;
-      const weekdayRaw = (obter("weekday") || "").toLowerCase();
-
-      const mapaDiaSemana = {
-        dom: 0,
-        seg: 1,
-        ter: 2,
-        qua: 3,
-        qui: 4,
-        sex: 5,
-        sab: 6,
-      };
-
-      return {
-        diaSemana: mapaDiaSemana[weekdayRaw.slice(0, 3)] ?? -1,
-        ano: Number.parseInt(obter("year"), 10),
-        mes: Number.parseInt(obter("month"), 10),
-        dia: Number.parseInt(obter("day"), 10),
-        hora: Number.parseInt(obter("hour"), 10),
-        minuto: Number.parseInt(obter("minute"), 10),
-      };
-    };
-
-    // Função para resetar status dos roteiros semanalmente (domingo) às 21h
-    const iniciarResetRoteirosSemanal = async () => {
-      const { resetarRoteirosDiarios } =
-        await import("./utils/resetRoteiros.js");
-
-      let ultimaDataReset = null;
-
-      const executarReset = async () => {
-        const agoraSp = getDataHoraSaoPaulo();
-
-        const ehDomingo = agoraSp.diaSemana === 0;
-        const janelaVinteUmaHoras = agoraSp.hora === 21 && agoraSp.minuto < 5;
-        const chaveDataHoje = `${agoraSp.ano}-${String(agoraSp.mes).padStart(2, "0")}-${String(agoraSp.dia).padStart(2, "0")}`;
-
-        // Recuperação: se o servidor reiniciar no domingo após 21h, executa uma vez naquele dia.
-        if (ehDomingo && (janelaVinteUmaHoras || (agoraSp.hora >= 21 && ultimaDataReset !== chaveDataHoje))) {
-          if (ultimaDataReset === chaveDataHoje) return;
-
-          console.log(
-            "🔄 Resetando status semanal dos roteiros e lojas para pendente (domingo 21h)...",
-          );
-          try {
-            await resetarRoteirosDiarios();
-            ultimaDataReset = chaveDataHoje;
-          } catch (error) {
-            console.error("❌ Erro no reset semanal dos roteiros:", error);
-          }
-        }
-      };
-
-      // Executa no boot e verifica a cada minuto.
-      await executarReset();
-      setInterval(executarReset, 60 * 1000);
-
-      console.log(
-        "⏰ Reset semanal dos roteiros agendado para domingo 21:00 (America/Sao_Paulo)",
-      );
-    };
   } catch (error) {
     console.error("❌ Erro ao conectar com o banco de dados:", error);
     process.exit(1);
