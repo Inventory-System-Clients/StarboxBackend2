@@ -128,7 +128,7 @@ export async function verificarMediaJogadasForaPadrao({
 
   const mensagem =
     `*⚠️ Máquina ${maquina.codigo || maquina.id}: saída de pelúcia errada — saiu ${saiu}*\n` +
-    `Jogadas médias por pelúcia: ${mediaCalculada.toFixed(2)} (ideal: ${faixa.min.toFixed(2)} a ${faixa.max.toFixed(2)})\n` +
+    `Jogadas médias por pelúcia: ${Math.round(mediaCalculada)} (ideal: ${Math.round(faixa.min)} a ${Math.round(faixa.max)})\n` +
     `Valor medido de saída de pelúcia: R$${valorMedidoSaidaPelucia.toFixed(2)} (ficha de R$${valorFicha.toFixed(2)})`;
 
   if (alertaExistente) {
