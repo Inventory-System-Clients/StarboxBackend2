@@ -69,7 +69,7 @@ export async function verificarMediaJogadasForaPadrao({
   // não mexe em nenhum alerta existente.
   if (quantidadeSaiu <= 0) return null;
 
-  const mediaCalculada = arredondar2(diferencaIn / quantidadeSaiu);
+  const mediaCalculada = arredondar2(diferencaIn / quantidadeSaiu / valorFicha);
   const dentroDaFaixa =
     mediaCalculada >= faixa.min && mediaCalculada <= faixa.max;
 
