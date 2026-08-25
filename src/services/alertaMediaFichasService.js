@@ -1,8 +1,10 @@
 import { WhatsAppAlerta } from "../models/index.js";
 
-// Faixa esperada de "jogadas médias por pelúcia" (quantas fichas jogadas
-// pra cada pelúcia liberada) por valor de ficha da máquina. Só essas duas
-// por enquanto — máquinas com outro valor de ficha não geram esse alerta.
+// Faixa esperada de "valor jogado por pelúcia liberada" (em R$) por valor
+// de ficha da máquina. Só essas duas por enquanto — máquinas com outro
+// valor de ficha não geram esse alerta. A faixa em JOGADAS (fichas por
+// pelúcia) é derivada dividindo esses R$ pelo valor da ficha da máquina —
+// ver faixaEmJogadas() abaixo.
 // Mantenha em sync com FAIXAS_MEDIA_POR_VALOR_FICHA em
 // frontend2/src/components/MovimentacaoMaquinaForm.jsx (usada pra dar o
 // aviso na hora, antes de salvar).
@@ -35,8 +37,16 @@ export async function verificarMediaJogadasForaPadrao({
   if (!maquina) return null;
 
   const valorFicha = Number(maquina.valorFicha || 0);
-  const faixa = FAIXAS_MEDIA_POR_VALOR_FICHA[valorFicha];
-  if (!faixa) return null;
+  const faixaValor = FAIXAS_MEDIA_POR_VALOR_FICHA[valorFicha];
+  if (!faixaValor || valorFicha <= 0) return null;
+
+  // faixaValor é em R$ (valor jogado por pelúcia); a faixa de JOGADAS
+  // (quantas fichas por pelúcia) pra essa máquina é esse R$ dividido pelo
+  // valor da própria ficha.
+  const faixa = {
+    min: arredondar2(faixaValor.min / valorFicha),
+    max: arredondar2(faixaValor.max / valorFicha),
+  };
 
   const contadorIn = Number(movimentacao.contadorIn);
   const contadorOut = Number(movimentacao.contadorOut);
@@ -89,9 +99,11 @@ export async function verificarMediaJogadasForaPadrao({
     return alertaExistente;
   }
 
-  const direcao = mediaCalculada > faixa.max ? "acima" : "abaixo";
+  const direcao = mediaCalculada < faixa.min ? "abaixo" : "acima";
+  const saiu = direcao === "abaixo" ? "muito" : "pouco";
   const limiteViolado = direcao === "acima" ? faixa.max : faixa.min;
   const diferenca = arredondar2(Math.abs(mediaCalculada - limiteViolado));
+  const valorMedidoSaidaPelucia = arredondar2(mediaCalculada * valorFicha);
 
   const metadataAtualizada = {
     movimentacaoId: movimentacao.id,
@@ -105,6 +117,7 @@ export async function verificarMediaJogadasForaPadrao({
     diferencaIn,
     quantidadeSaiu,
     mediaCalculada,
+    valorMedidoSaidaPelucia,
     faixaMin: faixa.min,
     faixaMax: faixa.max,
     direcao,
@@ -114,10 +127,9 @@ export async function verificarMediaJogadasForaPadrao({
   };
 
   const mensagem =
-    `Máquina ${maquina.codigo || maquina.id}: jogadas médias por pelúcia ` +
-    `fora da faixa esperada (${faixa.min.toFixed(2)} a ${faixa.max.toFixed(2)} ` +
-    `pra ficha de R$${valorFicha.toFixed(2)}). Leitura atual: ` +
-    `${mediaCalculada.toFixed(2)} (${diferenca.toFixed(2)} ${direcao} do limite).`;
+    `*⚠️ Máquina ${maquina.codigo || maquina.id}: saída de pelúcia errada — saiu ${saiu}*\n` +
+    `Jogadas médias por pelúcia: ${mediaCalculada.toFixed(2)} (ideal: ${faixa.min.toFixed(2)} a ${faixa.max.toFixed(2)})\n` +
+    `Valor medido de saída de pelúcia: R$${valorMedidoSaidaPelucia.toFixed(2)} (ficha de R$${valorFicha.toFixed(2)})`;
 
   if (alertaExistente) {
     await alertaExistente.update({ mensagem, metadata: metadataAtualizada });
