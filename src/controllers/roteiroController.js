@@ -205,6 +205,7 @@ export const criarRoteiro = async (req, res) => {
       orcamentoDiario,
       veiculoId,
       permiteGastos,
+      permiteFinalizarRota,
     } = req.body;
     const orcamentoRecebido =
       orcamentoSemanal !== undefined ? orcamentoSemanal : orcamentoDiario;
@@ -242,6 +243,8 @@ export const criarRoteiro = async (req, res) => {
       observacao: observacao?.trim() || null,
       veiculoId: veiculoIdNormalizado,
       permiteGastos: permiteGastos === undefined ? true : Boolean(permiteGastos),
+      permiteFinalizarRota:
+        permiteFinalizarRota === undefined ? true : Boolean(permiteFinalizarRota),
       ...(orcamentoRecebido !== undefined
         ? {
             orcamentoDiario: Number.parseFloat(

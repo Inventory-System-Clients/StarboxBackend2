@@ -62,6 +62,12 @@ const Roteiro = sequelize.define(
       defaultValue: true,
       field: "permiteGastos",
     },
+    permiteFinalizarRota: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: true,
+      field: "permiteFinalizarRota",
+    },
   },
   {
     hooks: {

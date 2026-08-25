@@ -988,6 +988,7 @@ router.patch(
         "observacao",
         "veiculoId",
         "permiteGastos",
+        "permiteFinalizarRota",
       ];
       const update = {};
       camposPermitidos.forEach((c) => {
@@ -996,6 +997,10 @@ router.patch(
 
       if (update.permiteGastos !== undefined) {
         update.permiteGastos = Boolean(update.permiteGastos);
+      }
+
+      if (update.permiteFinalizarRota !== undefined) {
+        update.permiteFinalizarRota = Boolean(update.permiteFinalizarRota);
       }
 
       if (hasFuncionarioPayload(req.body)) {

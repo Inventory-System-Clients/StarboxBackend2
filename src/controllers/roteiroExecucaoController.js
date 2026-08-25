@@ -409,6 +409,7 @@ async function getRoteiroExecucaoComStatus(req, res) {
       observacao: roteiro.observacao,
       funcionarioAbastecedor,
       permiteGastos: roteiro.permiteGastos !== false,
+      permiteFinalizarRota: roteiro.permiteFinalizarRota !== false,
       veiculoId: roteiro.veiculoId ?? null,
       veiculo: roteiro.veiculo
         ? {
@@ -740,6 +741,7 @@ async function getTodosRoteirosComStatus(req, res) {
         funcionarioNome: roteiro.funcionarioNome,
         funcionarioAbastecedor,
         permiteGastos: roteiro.permiteGastos !== false,
+      permiteFinalizarRota: roteiro.permiteFinalizarRota !== false,
         veiculoId: roteiro.veiculoId ?? null,
         veiculo: roteiro.veiculo
           ? {
