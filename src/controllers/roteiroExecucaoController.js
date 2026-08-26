@@ -623,6 +623,7 @@ async function getTodosRoteirosComStatus(req, res) {
       }
     }
 
+    const { inicioSemana } = getFaixaSemanaAtualUtc();
     const contextoPorRoteiro = new Map();
     roteiros.forEach((roteiro) => {
       const execucao = execucaoPorRoteiro.get(String(roteiro.id));
@@ -632,7 +633,11 @@ async function getTodosRoteirosComStatus(req, res) {
       const emAndamento = Boolean(execucao?.emAndamento);
       const finalizadoNaSemana = isFinalizadoNaSemana(execucao);
       const usarDataInicio = execucao && (emAndamento || finalizadoNaSemana);
-      const dataInicio = usarDataInicio ? dataInicioBase : dataHoje;
+      // Mesmo sem emAndamento marcado, não perde leituras de dias
+      // anteriores da mesma semana — só cai em "hoje" se não existe
+      // execução nenhuma pra esse roteiro (ver resolverContextoExecucaoSemanal).
+      const dataInicioFallback = execucao ? inicioSemana : dataHoje;
+      const dataInicio = usarDataInicio ? dataInicioBase : dataInicioFallback;
 
       contextoPorRoteiro.set(String(roteiro.id), {
         dataInicio,

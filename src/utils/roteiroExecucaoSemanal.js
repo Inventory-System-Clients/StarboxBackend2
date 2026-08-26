@@ -101,9 +101,19 @@ export const resolverContextoExecucaoSemanal = async (roteiroId) => {
   const finalizadoNaSemana = isFinalizadoNaSemana(execucao);
   const usarDataInicio = execucao && (emAndamento || finalizadoNaSemana);
 
+  // Se não dá pra confiar no emAndamento/finalizadoNaSemana (ex: o registro
+  // ficou com emAndamento=false sem o funcionário ter reiniciado a rota —
+  // era o caso do reset semanal automático, que já foi removido, mas pode
+  // acontecer de novo por outros motivos), não cai direto em "hoje": usa o
+  // início da semana atual como piso, pra não perder leituras de dias
+  // anteriores da mesma semana. Só cai em "hoje" mesmo quando não existe
+  // execução nenhuma registrada pra esse roteiro.
+  const { inicioSemana } = getFaixaSemanaAtualUtc();
+  const dataInicioFallback = execucao ? inicioSemana : dataHoje;
+
   return {
     dataHoje,
-    dataInicio: usarDataInicio ? dataInicioBase : dataHoje,
+    dataInicio: usarDataInicio ? dataInicioBase : dataInicioFallback,
     dataInicioBase,
     emAndamento,
     finalizadoNaSemana,
