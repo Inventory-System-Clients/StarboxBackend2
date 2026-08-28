@@ -70,8 +70,19 @@ export async function verificarMediaJogadasForaPadrao({
   if (quantidadeSaiu <= 0) return null;
 
   const mediaCalculada = arredondar2(diferencaIn / quantidadeSaiu / valorFicha);
+
+  // Compara pelo número ARREDONDADO (o mesmo que aparece na mensagem —
+  // "Jogadas médias por pelúcia: Math.round(mediaCalculada)"), não pelo
+  // valor cru. Sem isso, uma média real de 12,6 (exibida como "13") já
+  // dispara alerta por estar abaixo de faixa.min=13, mas na mensagem parece
+  // um alerta disparando "em cima" do próprio limite — daí a confusão. Só
+  // deve alertar quando o número que a pessoa vê está de fato fora da faixa.
+  const mediaArredondada = Math.round(mediaCalculada);
+  const faixaMinArredondada = Math.round(faixa.min);
+  const faixaMaxArredondada = Math.round(faixa.max);
   const dentroDaFaixa =
-    mediaCalculada >= faixa.min && mediaCalculada <= faixa.max;
+    mediaArredondada >= faixaMinArredondada &&
+    mediaArredondada <= faixaMaxArredondada;
 
   const alertaExistente = await WhatsAppAlerta.findOne({
     where: {
@@ -99,7 +110,7 @@ export async function verificarMediaJogadasForaPadrao({
     return alertaExistente;
   }
 
-  const direcao = mediaCalculada < faixa.min ? "abaixo" : "acima";
+  const direcao = mediaArredondada < faixaMinArredondada ? "abaixo" : "acima";
   const saiu = direcao === "abaixo" ? "muito" : "pouco";
   const limiteViolado = direcao === "acima" ? faixa.max : faixa.min;
   const diferenca = arredondar2(Math.abs(mediaCalculada - limiteViolado));
