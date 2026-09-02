@@ -1456,17 +1456,81 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       order: [["updatedAt", "ASC"]],
     });
 
-    const itens = movimentacoes.map((mov) => ({
-      id: mov.id,
-      maquinaId: mov.maquinaId,
-      maquinaNome: mov.maquina?.nome || mov.maquina?.codigo || mov.maquinaId,
-      resumo: mov.resumoWhatsapp,
-      createdAt: mov.updatedAt,
-    }));
+    // Uma movimentacao so tem leitura de contador de verdade quando
+    // contadorIn foi preenchido por uma leitura (o abastecimento extra
+    // nunca grava contadorIn/contadorOut - so produto/quantidade). Serve
+    // pra distinguir uma leitura real de uma movimentacao "em branco" que
+    // só recebeu abastecimento extra.
+    const possuiLeituraReal = (mov) =>
+      mov?.contadorIn !== null && mov?.contadorIn !== undefined;
 
-    // Maquinas da loja sem leitura dentro da janela da execucao atual (ex.: o
-    // PATCH de resumo-whatsapp falhou, ou a leitura ficou fora do corte de
-    // updatedAt). Para essas, busca a ultima movimentacao com resumo salvo,
+    // Uma mesma maquina pode acumular mais de uma movimentacao com
+    // resumoWhatsapp dentro da janela (ex.: abastecimento extra registrado
+    // numa movimentacao em branco antes da leitura de contador do dia ser
+    // feita, que cria uma movimentacao nova). Sem agrupar por maquina aqui,
+    // as duas viravam blocos duplicados na mensagem - um com os contadores
+    // reais e outro zerado, so com o abastecimento extra.
+    const movimentacoesPorMaquina = new Map();
+    for (const mov of movimentacoes) {
+      const chave = String(mov.maquinaId);
+      if (!movimentacoesPorMaquina.has(chave)) {
+        movimentacoesPorMaquina.set(chave, []);
+      }
+      movimentacoesPorMaquina.get(chave).push(mov);
+    }
+
+    const mesclarAbastecimentoExtraNoResumo = (resumoBase, movsDaMaquina, movPrincipalId) => {
+      const resumo = { ...(resumoBase && typeof resumoBase === "object" ? resumoBase : {}) };
+      if (Number(resumo.quantidadeAbastecimentoExtra || 0) > 0) return resumo;
+
+      const movComExtra = movsDaMaquina.find((mov) => {
+        if (mov.id === movPrincipalId) return false;
+        const quantidade = Number(mov.resumoWhatsapp?.quantidadeAbastecimentoExtra || 0);
+        return quantidade > 0;
+      });
+      if (!movComExtra) return resumo;
+
+      resumo.quantidadeAbastecimentoExtra = Number(
+        movComExtra.resumoWhatsapp.quantidadeAbastecimentoExtra || 0,
+      );
+      resumo.nomeProdutoAbastecimentoExtra =
+        movComExtra.resumoWhatsapp.nomeProdutoAbastecimentoExtra;
+      return resumo;
+    };
+
+    const itens = [];
+    for (const [, movsDaMaquina] of movimentacoesPorMaquina) {
+      const movComLeituraReal = movsDaMaquina.find(possuiLeituraReal);
+
+      if (!movComLeituraReal) {
+        // So tem movimentacao "em branco" (abastecimento extra) na janela -
+        // nao entra em itens, entao cai no bloco "maquinasSemLeitura" abaixo,
+        // que busca a ultima leitura real e mescla o abastecimento extra nela.
+        continue;
+      }
+
+      const resumo = mesclarAbastecimentoExtraNoResumo(
+        movComLeituraReal.resumoWhatsapp,
+        movsDaMaquina,
+        movComLeituraReal.id,
+      );
+
+      itens.push({
+        id: movComLeituraReal.id,
+        maquinaId: movComLeituraReal.maquinaId,
+        maquinaNome:
+          movComLeituraReal.maquina?.nome ||
+          movComLeituraReal.maquina?.codigo ||
+          movComLeituraReal.maquinaId,
+        resumo,
+        createdAt: movComLeituraReal.updatedAt,
+      });
+    }
+
+    // Maquinas da loja sem leitura real dentro da janela da execucao atual
+    // (ex.: o PATCH de resumo-whatsapp falhou, a leitura ficou fora do corte
+    // de updatedAt, ou so houve abastecimento extra ate agora). Para essas,
+    // busca a ultima movimentacao com leitura de contador de verdade,
     // independente da data, e monta a mensagem com ela mesmo assim.
     const maquinaIdsComLeitura = new Set(itens.map((item) => String(item.maquinaId)));
     const maquinasDaLoja = await Maquina.findAll({
@@ -1481,20 +1545,41 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       const ultimasLeituras = await Promise.all(
         maquinasSemLeitura.map((maquina) =>
           Movimentacao.findOne({
-            where: { maquinaId: maquina.id, resumoWhatsapp: { [Op.ne]: null } },
+            where: {
+              maquinaId: maquina.id,
+              resumoWhatsapp: { [Op.ne]: null },
+              contadorIn: { [Op.ne]: null },
+            },
             order: [["updatedAt", "DESC"]],
-          }),
+          }).then(
+            (mov) =>
+              mov ||
+              // Maquina nunca teve leitura de contador - usa a ultima
+              // movimentacao com resumo salvo mesmo que seja so abastecimento.
+              Movimentacao.findOne({
+                where: { maquinaId: maquina.id, resumoWhatsapp: { [Op.ne]: null } },
+                order: [["updatedAt", "DESC"]],
+              }),
+          ),
         ),
       );
 
       ultimasLeituras.forEach((mov, index) => {
         if (!mov) return;
         const maquina = maquinasSemLeitura[index];
+        const movsDaMaquinaNaJanela =
+          movimentacoesPorMaquina.get(String(maquina.id)) || [];
+        const resumo = mesclarAbastecimentoExtraNoResumo(
+          mov.resumoWhatsapp,
+          movsDaMaquinaNaJanela,
+          mov.id,
+        );
+
         itens.push({
           id: mov.id,
           maquinaId: mov.maquinaId,
           maquinaNome: maquina?.nome || maquina?.codigo || mov.maquinaId,
-          resumo: mov.resumoWhatsapp,
+          resumo,
           createdAt: mov.updatedAt,
         });
       });
