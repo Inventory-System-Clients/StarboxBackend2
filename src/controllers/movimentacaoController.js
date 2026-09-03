@@ -1481,21 +1481,23 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
 
     const mesclarAbastecimentoExtraNoResumo = (resumoBase, movsDaMaquina, movPrincipalId) => {
       const resumo = { ...(resumoBase && typeof resumoBase === "object" ? resumoBase : {}) };
-      if (Number(resumo.quantidadeAbastecimentoExtra || 0) > 0) return resumo;
+      if (Number(resumo.quantidadeAbastecimentoExtra || 0) > 0) {
+        return { resumo, movComExtra: null };
+      }
 
       const movComExtra = movsDaMaquina.find((mov) => {
         if (mov.id === movPrincipalId) return false;
         const quantidade = Number(mov.resumoWhatsapp?.quantidadeAbastecimentoExtra || 0);
         return quantidade > 0;
       });
-      if (!movComExtra) return resumo;
+      if (!movComExtra) return { resumo, movComExtra: null };
 
       resumo.quantidadeAbastecimentoExtra = Number(
         movComExtra.resumoWhatsapp.quantidadeAbastecimentoExtra || 0,
       );
       resumo.nomeProdutoAbastecimentoExtra =
         movComExtra.resumoWhatsapp.nomeProdutoAbastecimentoExtra;
-      return resumo;
+      return { resumo, movComExtra };
     };
 
     const itens = [];
@@ -1509,7 +1511,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
         continue;
       }
 
-      const resumo = mesclarAbastecimentoExtraNoResumo(
+      const { resumo, movComExtra } = mesclarAbastecimentoExtraNoResumo(
         movComLeituraReal.resumoWhatsapp,
         movsDaMaquina,
         movComLeituraReal.id,
@@ -1523,7 +1525,11 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
           movComLeituraReal.maquina?.codigo ||
           movComLeituraReal.maquinaId,
         resumo,
-        createdAt: movComLeituraReal.updatedAt,
+        // Se o abastecimento extra veio de uma movimentacao separada (mais
+        // recente que a leitura de contador), a data mostrada tem que ser a
+        // dele - senao a mensagem mostra a data da leitura antiga em vez da
+        // data de hoje, quando o unico registro novo foi o abastecimento.
+        createdAt: movComExtra?.updatedAt || movComLeituraReal.updatedAt,
       });
     }
 
@@ -1569,7 +1575,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
         const maquina = maquinasSemLeitura[index];
         const movsDaMaquinaNaJanela =
           movimentacoesPorMaquina.get(String(maquina.id)) || [];
-        const resumo = mesclarAbastecimentoExtraNoResumo(
+        const { resumo, movComExtra } = mesclarAbastecimentoExtraNoResumo(
           mov.resumoWhatsapp,
           movsDaMaquinaNaJanela,
           mov.id,
@@ -1580,7 +1586,11 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
           maquinaId: mov.maquinaId,
           maquinaNome: maquina?.nome || maquina?.codigo || mov.maquinaId,
           resumo,
-          createdAt: mov.updatedAt,
+          // Mesmo motivo do bloco acima: sem isso, uma maquina sem leitura de
+          // contador na janela (so abastecimento extra) mostra a data da
+          // ultima leitura real (que pode ser de dias atras) em vez da data
+          // do abastecimento de hoje.
+          createdAt: movComExtra?.updatedAt || mov.updatedAt,
         });
       });
 
