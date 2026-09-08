@@ -161,8 +161,15 @@ export const obterUltimoProduto = async (req, res) => {
       return res.json({ produtoId: null });
     }
 
+    // produtoNaMaquinaId é atualizado a cada abastecimento (inclusive
+    // abastecimento extra) e reflete o produto predominante agora. Usar
+    // detalhesProdutos[0] direto ficaria preso no primeiro produto lançado
+    // na movimentação, ignorando trocas feitas depois via abastecimento
+    // extra.
     const produtoId =
-      ultimaMovimentacao.detalhesProdutos?.[0]?.produtoId || null;
+      ultimaMovimentacao.produtoNaMaquinaId ||
+      ultimaMovimentacao.detalhesProdutos?.[0]?.produtoId ||
+      null;
     return res.json({ produtoId });
   } catch (error) {
     console.error("Erro ao obter último produto da máquina:", error);
