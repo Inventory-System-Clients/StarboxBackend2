@@ -1408,7 +1408,7 @@ export const atualizarResumoWhatsAppMovimentacao = async (req, res) => {
 // mesmo que duas tenham sido feitas na mesma maquina) sempre entra de novo.
 export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
   try {
-    const { roteiroId, lojaId } = req.query;
+    const { roteiroId, lojaId, maquinaId } = req.query;
 
     if (!roteiroId || !lojaId) {
       return res
@@ -1450,7 +1450,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
           model: Maquina,
           as: "maquina",
           attributes: ["id", "nome", "codigo", "lojaId"],
-          where: { lojaId },
+          where: { lojaId, ...(maquinaId ? { id: maquinaId } : {}) },
         },
       ],
       order: [["updatedAt", "ASC"]],
@@ -1540,7 +1540,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
     // independente da data, e monta a mensagem com ela mesmo assim.
     const maquinaIdsComLeitura = new Set(itens.map((item) => String(item.maquinaId)));
     const maquinasDaLoja = await Maquina.findAll({
-      where: { lojaId },
+      where: { lojaId, ...(maquinaId ? { id: maquinaId } : {}) },
       attributes: ["id", "nome", "codigo"],
     });
     const maquinasSemLeitura = maquinasDaLoja.filter(
