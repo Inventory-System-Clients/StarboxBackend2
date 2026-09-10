@@ -1391,12 +1391,30 @@ export const atualizarResumoWhatsAppMovimentacao = async (req, res) => {
       return res.status(404).json({ error: "Movimentação não encontrada" });
     }
 
-    const resumoParaSalvar = { ...resumo };
+    const ehAbastecimentoExtra =
+      Number(resumo.quantidadeAbastecimentoExtra || 0) > 0;
+    const resumoAnterior =
+      movimentacao.resumoWhatsapp &&
+      typeof movimentacao.resumoWhatsapp === "object" &&
+      !Array.isArray(movimentacao.resumoWhatsapp)
+        ? movimentacao.resumoWhatsapp
+        : {};
+    const resumoParaSalvar = ehAbastecimentoExtra
+      ? {
+          // O extra nao pode apagar os valores que pertencem a leitura.
+          ...resumoAnterior,
+          quantidadeAbastecimentoExtra: resumo.quantidadeAbastecimentoExtra,
+          nomeProdutoAbastecimentoExtra:
+            resumo.nomeProdutoAbastecimentoExtra,
+          dataAbastecimentoExtra:
+            resumo.dataMovimentacao || new Date().toISOString(),
+        }
+      : { ...resumo };
 
     // O abastecimento extra usa a mesma movimentacao da leitura como base.
     // Guardar o autor dele separadamente evita que a mensagem de quem fez a
     // leitura apresente uma reposicao realizada por outro funcionario.
-    if (Number(resumoParaSalvar.quantidadeAbastecimentoExtra || 0) > 0) {
+    if (ehAbastecimentoExtra) {
       resumoParaSalvar.usuarioAbastecimentoExtraId = req.usuario?.id || null;
       resumoParaSalvar.nomeUsuarioAbastecimentoExtra =
         req.usuario?.nome || resumoParaSalvar.nomeUsuario || null;
