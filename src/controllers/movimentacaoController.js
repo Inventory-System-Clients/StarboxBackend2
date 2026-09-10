@@ -1391,7 +1391,18 @@ export const atualizarResumoWhatsAppMovimentacao = async (req, res) => {
       return res.status(404).json({ error: "Movimentação não encontrada" });
     }
 
-    await movimentacao.update({ resumoWhatsapp: resumo });
+    const resumoParaSalvar = { ...resumo };
+
+    // O abastecimento extra usa a mesma movimentacao da leitura como base.
+    // Guardar o autor dele separadamente evita que a mensagem de quem fez a
+    // leitura apresente uma reposicao realizada por outro funcionario.
+    if (Number(resumoParaSalvar.quantidadeAbastecimentoExtra || 0) > 0) {
+      resumoParaSalvar.usuarioAbastecimentoExtraId = req.usuario?.id || null;
+      resumoParaSalvar.nomeUsuarioAbastecimentoExtra =
+        req.usuario?.nome || resumoParaSalvar.nomeUsuario || null;
+    }
+
+    await movimentacao.update({ resumoWhatsapp: resumoParaSalvar });
 
     res.json({ success: true });
   } catch (error) {
@@ -1427,6 +1438,10 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
     const ehRoteiroAbastecedor = await roteiroTemFuncionarioAbastecedor(
       roteiroConsultado,
     );
+    const deveExibirSomenteLeiturasDoUsuario = [
+      "FUNCIONARIO",
+      "FUNCIONARIO_TODAS_LOJAS",
+    ].includes(req.usuario?.role);
 
     const contexto = await resolverContextoExecucaoSemanal(roteiroId);
     const inicioExecucao = new Date(`${contexto.dataInicio}T00:00:00.000Z`);
@@ -1442,6 +1457,9 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
     const movimentacoes = await Movimentacao.findAll({
       where: {
         roteiroId,
+        ...(deveExibirSomenteLeiturasDoUsuario
+          ? { usuarioId: req.usuario.id }
+          : {}),
         resumoWhatsapp: { [Op.ne]: null },
         updatedAt: { [Op.gte]: inicioExecucao },
       },
@@ -1479,8 +1497,43 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       movimentacoesPorMaquina.get(chave).push(mov);
     }
 
+    const extraPertenceAoUsuarioAtual = (resumo) => {
+      if (!deveExibirSomenteLeiturasDoUsuario) return true;
+
+      const usuarioExtraId = resumo?.usuarioAbastecimentoExtraId;
+      if (usuarioExtraId) {
+        return String(usuarioExtraId) === String(req.usuario?.id);
+      }
+
+      // Registros anteriores a este campo trazem apenas o nome de quem fez o
+      // extra. Esse fallback impede que mensagens antigas continuem misturadas.
+      const nomeExtra = String(resumo?.nomeUsuario || "")
+        .trim()
+        .toLocaleLowerCase("pt-BR");
+      const nomeUsuarioAtual = String(req.usuario?.nome || "")
+        .trim()
+        .toLocaleLowerCase("pt-BR");
+      return !nomeExtra || nomeExtra === nomeUsuarioAtual;
+    };
+
+    const removerAbastecimentoExtraDeOutroUsuario = (resumoBase) => {
+      const resumo = {
+        ...(resumoBase && typeof resumoBase === "object" ? resumoBase : {}),
+      };
+      if (
+        Number(resumo.quantidadeAbastecimentoExtra || 0) > 0 &&
+        !extraPertenceAoUsuarioAtual(resumo)
+      ) {
+        resumo.quantidadeAbastecimentoExtra = 0;
+        delete resumo.nomeProdutoAbastecimentoExtra;
+        delete resumo.usuarioAbastecimentoExtraId;
+        delete resumo.nomeUsuarioAbastecimentoExtra;
+      }
+      return resumo;
+    };
+
     const mesclarAbastecimentoExtraNoResumo = (resumoBase, movsDaMaquina, movPrincipalId) => {
-      const resumo = { ...(resumoBase && typeof resumoBase === "object" ? resumoBase : {}) };
+      const resumo = removerAbastecimentoExtraDeOutroUsuario(resumoBase);
       if (Number(resumo.quantidadeAbastecimentoExtra || 0) > 0) {
         return { resumo, movComExtra: null };
       }
@@ -1488,7 +1541,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       const movComExtra = movsDaMaquina.find((mov) => {
         if (mov.id === movPrincipalId) return false;
         const quantidade = Number(mov.resumoWhatsapp?.quantidadeAbastecimentoExtra || 0);
-        return quantidade > 0;
+        return quantidade > 0 && extraPertenceAoUsuarioAtual(mov.resumoWhatsapp);
       });
       if (!movComExtra) return { resumo, movComExtra: null };
 
@@ -1553,6 +1606,9 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
           Movimentacao.findOne({
             where: {
               maquinaId: maquina.id,
+              ...(deveExibirSomenteLeiturasDoUsuario
+                ? { usuarioId: req.usuario.id }
+                : {}),
               resumoWhatsapp: { [Op.ne]: null },
               contadorIn: { [Op.ne]: null },
             },
@@ -1563,7 +1619,13 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
               // Maquina nunca teve leitura de contador - usa a ultima
               // movimentacao com resumo salvo mesmo que seja so abastecimento.
               Movimentacao.findOne({
-                where: { maquinaId: maquina.id, resumoWhatsapp: { [Op.ne]: null } },
+                where: {
+                  maquinaId: maquina.id,
+                  ...(deveExibirSomenteLeiturasDoUsuario
+                    ? { usuarioId: req.usuario.id }
+                    : {}),
+                  resumoWhatsapp: { [Op.ne]: null },
+                },
                 order: [["updatedAt", "DESC"]],
               }),
           ),
@@ -1599,8 +1661,18 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       );
     }
 
-    const itensFinal = ehRoteiroAbastecedor
+    const itensComAutorDaLeitura = deveExibirSomenteLeiturasDoUsuario
       ? itens.map((item) => ({
+          ...item,
+          resumo:
+            item.resumo && typeof item.resumo === "object"
+              ? { ...item.resumo, nomeUsuario: req.usuario?.nome || item.resumo.nomeUsuario }
+              : item.resumo,
+        }))
+      : itens;
+
+    const itensFinal = ehRoteiroAbastecedor
+      ? itensComAutorDaLeitura.map((item) => ({
           ...item,
           resumo:
             item.resumo && typeof item.resumo === "object"
@@ -1617,7 +1689,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
                 }
               : item.resumo,
         }))
-      : itens;
+      : itensComAutorDaLeitura;
 
     res.json(itensFinal);
   } catch (error) {
