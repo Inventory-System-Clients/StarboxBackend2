@@ -1399,11 +1399,26 @@ export const atualizarResumoWhatsAppMovimentacao = async (req, res) => {
       !Array.isArray(movimentacao.resumoWhatsapp)
         ? movimentacao.resumoWhatsapp
         : {};
+    // Quando o mesmo produto ja tinha um abastecimento extra registrado
+    // nesta leitura (abastecedor voltou e reforcou de novo), a quantidade
+    // tem que SOMAR a anterior, nao substituir - o endpoint de estoque
+    // (registrarAbastecimentoExtra) ja soma a cada chamada, entao o estoque
+    // fica certo mesmo com varias chamadas; se aqui a gente so sobrescrevesse
+    // com o valor da ultima chamada, a mensagem/leitura ficaria divergente do
+    // que foi de fato lancado (e do que saiu do estoque).
+    const produtoIgualAoExtraAnterior =
+      ehAbastecimentoExtra &&
+      Number(resumoAnterior.quantidadeAbastecimentoExtra || 0) > 0 &&
+      resumoAnterior.nomeProdutoAbastecimentoExtra ===
+        resumo.nomeProdutoAbastecimentoExtra;
     const resumoParaSalvar = ehAbastecimentoExtra
       ? {
           // O extra nao pode apagar os valores que pertencem a leitura.
           ...resumoAnterior,
-          quantidadeAbastecimentoExtra: resumo.quantidadeAbastecimentoExtra,
+          quantidadeAbastecimentoExtra: produtoIgualAoExtraAnterior
+            ? Number(resumoAnterior.quantidadeAbastecimentoExtra || 0) +
+              Number(resumo.quantidadeAbastecimentoExtra || 0)
+            : resumo.quantidadeAbastecimentoExtra,
           nomeProdutoAbastecimentoExtra:
             resumo.nomeProdutoAbastecimentoExtra,
           dataAbastecimentoExtra:
@@ -1515,6 +1530,56 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       movimentacoesPorMaquina.get(chave).push(mov);
     }
 
+    // A mesma loja pode ser atendida por mais de um roteiro ao mesmo tempo
+    // (ex.: o roteiro de coleta/contador de um funcionário e o roteiro de um
+    // abastecedor, que só repõe produto). "movimentacoes" acima é filtrado
+    // por UM roteiroId só - se o abastecedor fez um abastecimento extra pelo
+    // roteiro dele, essa movimentação fica de fora quando a mensagem é
+    // montada a partir do OUTRO roteiro (o de contador), e a mensagem acaba
+    // usando um abastecimento extra antigo, gravado junto da última leitura
+    // de contador daquele outro roteiro (dias atrás), em vez do mais recente.
+    // Por isso essa busca aqui NÃO filtra por roteiroId: pega, por máquina
+    // desta loja, a movimentação mais recente com abastecimento extra > 0,
+    // não importa em qual roteiro foi registrada.
+    const extrasRecentesPorMaquina = new Map();
+    try {
+      const candidatosExtraCrossRoteiro = await Movimentacao.findAll({
+        where: {
+          resumoWhatsapp: { [Op.ne]: null },
+          [Op.and]: [
+            Movimentacao.sequelize.literal(
+              `("resumo_whatsapp"->>'quantidadeAbastecimentoExtra')::numeric > 0`,
+            ),
+          ],
+        },
+        include: [
+          {
+            model: Maquina,
+            as: "maquina",
+            attributes: [],
+            where: { lojaId, ...(maquinaId ? { id: maquinaId } : {}) },
+          },
+        ],
+        order: [["updatedAt", "DESC"]],
+      });
+      for (const mov of candidatosExtraCrossRoteiro) {
+        const chave = String(mov.maquinaId);
+        // order updatedAt DESC - o primeiro que aparece pra cada maquina ja
+        // e o mais recente.
+        if (!extrasRecentesPorMaquina.has(chave)) {
+          extrasRecentesPorMaquina.set(chave, mov);
+        }
+      }
+    } catch (erroCrossRoteiro) {
+      // Nao deve derrubar a montagem da mensagem por causa dessa checagem
+      // extra - na pior das hipoteses ela so deixa de pegar um abastecimento
+      // extra feito em outro roteiro.
+      console.error(
+        "Erro ao buscar abastecimento extra de outros roteiros:",
+        erroCrossRoteiro,
+      );
+    }
+
     const extraPertenceAoUsuarioAtual = (resumo) => {
       if (!deveExibirSomenteLeiturasDoUsuario) return true;
 
@@ -1550,21 +1615,71 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       return resumo;
     };
 
-    const mesclarAbastecimentoExtraNoResumo = (resumoBase, movsDaMaquina, movPrincipalId) => {
+    const mesclarAbastecimentoExtraNoResumo = (
+      resumoBase,
+      movsDaMaquina,
+      movPrincipalId,
+      movExtraCrossRoteiro,
+    ) => {
       const resumo = removerAbastecimentoExtraDeOutroUsuario(resumoBase);
-      if (Number(resumo.quantidadeAbastecimentoExtra || 0) > 0) {
+
+      // Timestamp do extra que já está "colado" na leitura (se houver). Antes,
+      // a funcao parava aqui e nunca olhava outras movimentacoes quando a
+      // leitura ja trazia extra>0 - isso fazia a mensagem mostrar o extra
+      // ANTIGO gravado junto da ultima leitura de contador (que pode ser de
+      // dias atras) mesmo quando o abastecedor tinha acabado de fazer um
+      // abastecimento extra novo, numa movimentacao em branco separada, DEPOIS
+      // dessa leitura. Resultado: a leitura saia com a quantidade errada
+      // enquanto o estoque (que usa outro caminho) continuava batendo certo.
+      const extraDaLeituraExiste = Number(resumo.quantidadeAbastecimentoExtra || 0) > 0;
+      const timestampExtraDaLeitura = extraDaLeituraExiste
+        ? new Date(resumo.dataAbastecimentoExtra || resumo.dataMovimentacao || 0).getTime()
+        : null;
+
+      // Junta os candidatos da janela do roteiro atual com o candidato
+      // "cross-roteiro" (mais recente abastecimento extra da maquina, de
+      // qualquer roteiro) - evitando duplicar se for a mesma movimentacao.
+      const candidatosBrutos = [...movsDaMaquina];
+      if (
+        movExtraCrossRoteiro &&
+        !candidatosBrutos.some((mov) => mov.id === movExtraCrossRoteiro.id)
+      ) {
+        candidatosBrutos.push(movExtraCrossRoteiro);
+      }
+
+      const movsComExtra = candidatosBrutos
+        .filter((mov) => {
+          if (mov.id === movPrincipalId) return false;
+          const quantidade = Number(mov.resumoWhatsapp?.quantidadeAbastecimentoExtra || 0);
+          return quantidade > 0 && extraPertenceAoUsuarioAtual(mov.resumoWhatsapp);
+        })
+        // So conta abastecimento extra feito DEPOIS do que ja esta colado na
+        // leitura - um extra mais antigo que a leitura ja foi contabilizado
+        // nela e nao deve ser somado de novo.
+        .filter((mov) => {
+          if (timestampExtraDaLeitura === null) return true;
+          const timestampMov = new Date(
+            mov.resumoWhatsapp?.dataAbastecimentoExtra || mov.updatedAt,
+          ).getTime();
+          return timestampMov > timestampExtraDaLeitura;
+        });
+
+      if (movsComExtra.length === 0) {
         return { resumo, movComExtra: null };
       }
 
-      const movComExtra = movsDaMaquina.find((mov) => {
-        if (mov.id === movPrincipalId) return false;
-        const quantidade = Number(mov.resumoWhatsapp?.quantidadeAbastecimentoExtra || 0);
-        return quantidade > 0 && extraPertenceAoUsuarioAtual(mov.resumoWhatsapp);
-      });
-      if (!movComExtra) return { resumo, movComExtra: null };
-
-      resumo.quantidadeAbastecimentoExtra = Number(
-        movComExtra.resumoWhatsapp.quantidadeAbastecimentoExtra || 0,
+      // Pode existir mais de uma movimentacao "em branco" com abastecimento
+      // extra mais novo que a leitura (ex.: abastecedor reforcou o produto
+      // mais de uma vez depois da ultima leitura de contador) - soma todas
+      // elas. O extra que ja estava "colado" na leitura NAO entra nessa
+      // soma: ele e mais antigo que os candidatos aqui (filtro acima) e,
+      // assim como o resto do resumo, ja se refere a um abastecimento
+      // separado/ja concluido - somar de novo faria dobrar a quantidade.
+      const movComExtra = movsComExtra[movsComExtra.length - 1];
+      resumo.quantidadeAbastecimentoExtra = movsComExtra.reduce(
+        (soma, mov) =>
+          soma + Number(mov.resumoWhatsapp?.quantidadeAbastecimentoExtra || 0),
+        0,
       );
       resumo.nomeProdutoAbastecimentoExtra =
         movComExtra.resumoWhatsapp.nomeProdutoAbastecimentoExtra;
@@ -1586,6 +1701,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
         movComLeituraReal.resumoWhatsapp,
         movsDaMaquina,
         movComLeituraReal.id,
+        extrasRecentesPorMaquina.get(String(movComLeituraReal.maquinaId)),
       );
 
       itens.push({
@@ -1659,6 +1775,7 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
           mov.resumoWhatsapp,
           movsDaMaquinaNaJanela,
           mov.id,
+          extrasRecentesPorMaquina.get(String(maquina.id)),
         );
 
         itens.push({
