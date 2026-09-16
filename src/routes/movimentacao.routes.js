@@ -6,6 +6,10 @@ import {
   obterMovimentacao,
   atualizarMovimentacao,
   registrarAbastecimentoExtra,
+  listarAbastecimentosExtras,
+  buscarAbastecimentosExtras,
+  atualizarAbastecimentoExtra,
+  deletarAbastecimentoExtra,
   deletarMovimentacao,
   relatorioMovimentacoesDia,
   relatorioLucroTotalDia,
@@ -49,6 +53,29 @@ router.get(
   listarLeiturasWhatsAppDaLoja,
 );
 
+// Busca/edição de lançamentos individuais de abastecimento extra (tela de
+// suporte). Precisa vir antes de "/:id" para não ser capturada por ela.
+router.get(
+  "/abastecimentos-extras",
+  autenticar,
+  autorizar(["ADMIN"]),
+  buscarAbastecimentosExtras,
+);
+router.put(
+  "/abastecimentos-extras/:id",
+  autenticar,
+  autorizar(["ADMIN"]),
+  registrarLog("EDITAR_ABASTECIMENTO_EXTRA", "AbastecimentoExtra"),
+  atualizarAbastecimentoExtra,
+);
+router.delete(
+  "/abastecimentos-extras/:id",
+  autenticar,
+  autorizar(["ADMIN"]),
+  registrarLog("DELETAR_ABASTECIMENTO_EXTRA", "AbastecimentoExtra"),
+  deletarAbastecimentoExtra,
+);
+
 router.get("/:id", autenticar, obterMovimentacao);
 router.post(
   "/",
@@ -67,6 +94,11 @@ router.patch(
   autenticar,
   registrarLog("ABASTECIMENTO_EXTRA_MOVIMENTACAO", "Movimentacao"),
   registrarAbastecimentoExtra,
+);
+router.get(
+  "/:id/abastecimentos-extras",
+  autenticar,
+  listarAbastecimentosExtras,
 );
 router.patch(
   "/:id/resumo-whatsapp",

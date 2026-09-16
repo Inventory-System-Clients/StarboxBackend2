@@ -60,6 +60,7 @@ import ManutencaoWhatsAppPrompt from "./ManutencaoWhatsAppPrompt.js";
 import PecaDefeituosaPendente from "./PecaDefeituosaPendente.js";
 import PecaDefeituosaBase from "./PecaDefeituosaBase.js";
 import BaseSecundariaDashboard from "./BaseSecundariaDashboard.js";
+import AbastecimentoExtra from "./AbastecimentoExtra.js";
 Roteiro.associate({ Usuario, Loja, RoteiroLoja, Veiculo });
 Veiculo.hasMany(Roteiro, { foreignKey: "veiculoId", as: "roteiros" });
 // Movimentação de Veículo -> Veículo e Usuário
@@ -135,6 +136,18 @@ Movimentacao.hasMany(MovimentacaoProduto, {
   as: "detalhesProdutos",
 });
 MovimentacaoProduto.belongsTo(Movimentacao, { foreignKey: "movimentacaoId" });
+
+// AbastecimentoExtra -> Movimentacao/Maquina/Usuario/Produto/Roteiro
+Movimentacao.hasMany(AbastecimentoExtra, {
+  foreignKey: "movimentacaoId",
+  as: "abastecimentosExtras",
+});
+AbastecimentoExtra.belongsTo(Movimentacao, { foreignKey: "movimentacaoId" });
+AbastecimentoExtra.belongsTo(Maquina, { foreignKey: "maquinaId", as: "maquina" });
+AbastecimentoExtra.belongsTo(Usuario, { foreignKey: "usuarioId", as: "usuario" });
+AbastecimentoExtra.belongsTo(Produto, { foreignKey: "produtoId", as: "produto" });
+AbastecimentoExtra.belongsTo(Roteiro, { foreignKey: "roteiroId", as: "roteiro" });
+
 MovimentacaoProduto.belongsTo(Produto, {
   foreignKey: "produtoId",
   as: "produto",
@@ -587,4 +600,5 @@ export {
   PecaDefeituosaPendente,
   PecaDefeituosaBase,
   BaseSecundariaDashboard,
+  AbastecimentoExtra,
 };

@@ -16,6 +16,7 @@ import {
   Roteiro,
   RoteiroLoja,
   UsuarioLoja,
+  AbastecimentoExtra,
 } from "../models/index.js";
 import { Op } from "sequelize";
 import { randomUUID } from "node:crypto";
@@ -2646,6 +2647,21 @@ export const registrarAbastecimentoExtra = async (req, res) => {
       { transaction },
     );
 
+    // Registro individual deste lançamento (auditoria/correção pontual),
+    // separado do total acumulado em movimentacao.abastecidas.
+    await AbastecimentoExtra.create(
+      {
+        movimentacaoId: movimentacao.id,
+        maquinaId: maquina.id,
+        roteiroId: roteiro?.id || movimentacao.roteiroId || null,
+        usuarioId: req.usuario.id,
+        produtoId,
+        quantidade: quantidadeExtra,
+        origemEstoque,
+      },
+      { transaction },
+    );
+
     const movimentacaoAtualizada = await Movimentacao.findByPk(req.params.id, {
       include: [
         {
@@ -2717,6 +2733,279 @@ export const registrarAbastecimentoExtra = async (req, res) => {
     return res.status(500).json({
       error: "Erro interno ao registrar abastecimento",
     });
+  }
+};
+
+// Lista o histórico individual de abastecimentos extras de uma movimentação
+// (cada lançamento separado, em vez do total acumulado em .abastecidas).
+export const listarAbastecimentosExtras = async (req, res) => {
+  try {
+    const movimentacao = await Movimentacao.findByPk(req.params.id, {
+      attributes: ["id"],
+    });
+
+    if (!movimentacao) {
+      return res.status(404).json({ error: "Movimentação não encontrada" });
+    }
+
+    const abastecimentos = await AbastecimentoExtra.findAll({
+      where: { movimentacaoId: req.params.id },
+      include: [
+        { model: Usuario, as: "usuario", attributes: ["id", "nome"] },
+        { model: Produto, as: "produto", attributes: ["id", "nome"] },
+      ],
+      order: [["createdAt", "DESC"]],
+    });
+
+    return res.json(abastecimentos);
+  } catch (error) {
+    console.error("Erro ao listar abastecimentos extras:", error);
+    return res
+      .status(500)
+      .json({ error: "Erro ao listar abastecimentos extras" });
+  }
+};
+
+// Busca paginada de abastecimentos extras (tela de suporte/admin, pra achar
+// rápido o lançamento certo quando o abastecedor manda mensagem sobre um
+// abastecimento e não bate com o que o cliente relatou).
+export const buscarAbastecimentosExtras = async (req, res) => {
+  try {
+    const { lojaId, maquinaId, usuarioId, dataInicio, dataFim } = req.query;
+    const params = parseListParams(req.query, {
+      defaultPageSize: 25,
+      maxPageSize: 100,
+    });
+
+    const where = {};
+    if (maquinaId) where.maquinaId = maquinaId;
+    if (usuarioId) where.usuarioId = usuarioId;
+    if (dataInicio || dataFim) {
+      const inicio = dataInicio ? new Date(`${dataInicio}T00:00:00`) : new Date(0);
+      const fim = dataFim ? new Date(`${dataFim}T23:59:59.999`) : new Date();
+      where.createdAt = { [Op.between]: [inicio, fim] };
+    }
+
+    const { rows, count } = await AbastecimentoExtra.findAndCountAll({
+      where,
+      include: [
+        {
+          model: Maquina,
+          as: "maquina",
+          attributes: ["id", "codigo", "nome", "lojaId"],
+          ...(lojaId ? { where: { lojaId } } : {}),
+          include: [{ model: Loja, as: "loja", attributes: ["id", "nome"] }],
+        },
+        { model: Usuario, as: "usuario", attributes: ["id", "nome"] },
+        { model: Produto, as: "produto", attributes: ["id", "nome"] },
+      ],
+      order: [["createdAt", "DESC"]],
+      limit: params.limit,
+      offset: params.offset,
+      distinct: true,
+    });
+
+    return res.json(buildPaginatedResponse(rows, count, params));
+  } catch (error) {
+    console.error("Erro ao buscar abastecimentos extras:", error);
+    return res
+      .status(500)
+      .json({ error: "Erro ao buscar abastecimentos extras" });
+  }
+};
+
+// Ajusta o total acumulado da movimentação base, o detalhe por produto e o
+// estoque de origem em `delta` unidades - usado tanto pra editar quanto pra
+// apagar um lançamento individual de abastecimento extra.
+const ajustarEfeitoAbastecimentoExtra = async (
+  abastecimento,
+  delta,
+  transaction,
+) => {
+  if (!delta) return;
+
+  const lock = { lock: transaction.LOCK?.UPDATE };
+  const movimentacao = await Movimentacao.findByPk(
+    abastecimento.movimentacaoId,
+    { transaction, ...lock },
+  );
+
+  if (!movimentacao) {
+    const erro = new Error("Movimentação vinculada não encontrada");
+    erro.status = 404;
+    throw erro;
+  }
+
+  let estoqueOrigem = null;
+  if (abastecimento.origemEstoque === "usuario") {
+    estoqueOrigem = await EstoqueUsuario.findOne({
+      where: {
+        usuarioId: abastecimento.usuarioId,
+        produtoId: abastecimento.produtoId,
+      },
+      transaction,
+      ...lock,
+    });
+  } else {
+    const maquina = await Maquina.findByPk(abastecimento.maquinaId, {
+      attributes: ["lojaId"],
+      transaction,
+    });
+    estoqueOrigem = await EstoqueLoja.findOne({
+      where: { lojaId: maquina.lojaId, produtoId: abastecimento.produtoId },
+      transaction,
+      ...lock,
+    });
+  }
+
+  if (!estoqueOrigem) {
+    const erro = new Error(
+      "Estoque de origem não encontrado para ajustar a diferença",
+    );
+    erro.status = 404;
+    throw erro;
+  }
+
+  const saldoAtual = Number(estoqueOrigem.quantidade || 0);
+  const saldoNovo = saldoAtual - delta; // delta > 0 consome mais estoque
+
+  if (saldoNovo < 0) {
+    const erro = new Error(
+      "Estoque insuficiente para aumentar esta quantidade",
+    );
+    erro.status = 409;
+    throw erro;
+  }
+
+  await estoqueOrigem.update({ quantidade: saldoNovo }, { transaction });
+
+  const detalhe = await MovimentacaoProduto.findOne({
+    where: {
+      movimentacaoId: movimentacao.id,
+      produtoId: abastecimento.produtoId,
+    },
+    transaction,
+    ...lock,
+  });
+  if (detalhe) {
+    const novaQuantidadeDetalhe = Math.max(
+      Number(detalhe.quantidadeAbastecida || 0) + delta,
+      0,
+    );
+    await detalhe.update(
+      { quantidadeAbastecida: novaQuantidadeDetalhe },
+      { transaction },
+    );
+  }
+
+  const abastecidasNovas = Math.max(
+    Number(movimentacao.abastecidas || 0) + delta,
+    0,
+  );
+  const totalPosNovo = Number(movimentacao.totalPos || 0) + delta;
+  const totalPreAjustado = totalPosNovo - abastecidasNovas;
+
+  await movimentacao.update(
+    {
+      totalPre: totalPreAjustado,
+      abastecidas: abastecidasNovas,
+      totalPos: totalPosNovo,
+    },
+    { transaction },
+  );
+};
+
+// Corrige a quantidade de um lançamento específico (ex.: abastecedor digitou
+// 30 em vez de 10), propagando a diferença pro total da movimentação base e
+// devolvendo/descontando o saldo no estoque de onde ele saiu.
+export const atualizarAbastecimentoExtra = async (req, res) => {
+  let transaction = null;
+  try {
+    const quantidadeNova = Number(req.body?.quantidade);
+
+    if (!Number.isInteger(quantidadeNova) || quantidadeNova <= 0) {
+      return res.status(400).json({
+        error: "quantidade deve ser um número inteiro maior que zero",
+      });
+    }
+
+    transaction = await Movimentacao.sequelize.transaction();
+
+    const abastecimento = await AbastecimentoExtra.findByPk(req.params.id, {
+      transaction,
+    });
+
+    if (!abastecimento) {
+      await transaction.rollback();
+      return res
+        .status(404)
+        .json({ error: "Abastecimento extra não encontrado" });
+    }
+
+    const delta = quantidadeNova - Number(abastecimento.quantidade);
+    await ajustarEfeitoAbastecimentoExtra(abastecimento, delta, transaction);
+    await abastecimento.update({ quantidade: quantidadeNova }, { transaction });
+
+    await transaction.commit();
+    transaction = null;
+
+    return res.json(abastecimento);
+  } catch (error) {
+    if (transaction) {
+      try {
+        await transaction.rollback();
+      } catch {
+        // Sem ação adicional.
+      }
+    }
+    console.error("Erro ao editar abastecimento extra:", error);
+    return res
+      .status(error.status || 500)
+      .json({ error: error.status ? error.message : "Erro ao editar abastecimento extra" });
+  }
+};
+
+// Remove um lançamento individual (ex.: abastecedor registrou em duplicidade)
+// e devolve o efeito dele no total da movimentação base e no estoque.
+export const deletarAbastecimentoExtra = async (req, res) => {
+  let transaction = null;
+  try {
+    transaction = await Movimentacao.sequelize.transaction();
+
+    const abastecimento = await AbastecimentoExtra.findByPk(req.params.id, {
+      transaction,
+    });
+
+    if (!abastecimento) {
+      await transaction.rollback();
+      return res
+        .status(404)
+        .json({ error: "Abastecimento extra não encontrado" });
+    }
+
+    await ajustarEfeitoAbastecimentoExtra(
+      abastecimento,
+      -Number(abastecimento.quantidade),
+      transaction,
+    );
+    await abastecimento.destroy({ transaction });
+
+    await transaction.commit();
+    transaction = null;
+
+    return res.json({ success: true });
+  } catch (error) {
+    if (transaction) {
+      try {
+        await transaction.rollback();
+      } catch {
+        // Sem ação adicional.
+      }
+    }
+    console.error("Erro ao apagar abastecimento extra:", error);
+    return res
+      .status(error.status || 500)
+      .json({ error: error.status ? error.message : "Erro ao apagar abastecimento extra" });
   }
 };
 
