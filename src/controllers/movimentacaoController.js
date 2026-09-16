@@ -1401,14 +1401,27 @@ export const atualizarResumoWhatsAppMovimentacao = async (req, res) => {
         ? movimentacao.resumoWhatsapp
         : {};
     // Quando o mesmo produto ja tinha um abastecimento extra registrado
-    // nesta leitura (abastecedor voltou e reforcou de novo), a quantidade
-    // tem que SOMAR a anterior, nao substituir - o endpoint de estoque
-    // (registrarAbastecimentoExtra) ja soma a cada chamada, entao o estoque
-    // fica certo mesmo com varias chamadas; se aqui a gente so sobrescrevesse
-    // com o valor da ultima chamada, a mensagem/leitura ficaria divergente do
-    // que foi de fato lancado (e do que saiu do estoque).
+    // HOJE nesta leitura (abastecedor voltou e reforcou de novo no mesmo
+    // dia), a quantidade tem que SOMAR a anterior, nao substituir - o
+    // endpoint de estoque (registrarAbastecimentoExtra) ja soma a cada
+    // chamada, entao o estoque fica certo mesmo com varias chamadas; se aqui
+    // a gente so sobrescrevesse com o valor da ultima chamada, a
+    // mensagem/leitura ficaria divergente do que foi de fato lancado (e do
+    // que saiu do estoque).
+    // A checagem de "mesmo dia" e essencial: a movimentacao-base e
+    // reaproveitada por semanas (nao ha uma leitura nova a cada visita), entao
+    // sem isso um valor de dias atras que nunca foi limpo ficava somado
+    // silenciosamente na mensagem de uma visita completamente diferente.
+    const dataExtraAnterior = resumoAnterior.dataAbastecimentoExtra
+      ? new Date(resumoAnterior.dataAbastecimentoExtra)
+      : null;
+    const extraAnteriorEhDeHoje =
+      dataExtraAnterior instanceof Date &&
+      !Number.isNaN(dataExtraAnterior.getTime()) &&
+      dataExtraAnterior.toDateString() === new Date().toDateString();
     const produtoIgualAoExtraAnterior =
       ehAbastecimentoExtra &&
+      extraAnteriorEhDeHoje &&
       Number(resumoAnterior.quantidadeAbastecimentoExtra || 0) > 0 &&
       resumoAnterior.nomeProdutoAbastecimentoExtra ===
         resumo.nomeProdutoAbastecimentoExtra;
