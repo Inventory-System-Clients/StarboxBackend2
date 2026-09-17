@@ -82,6 +82,7 @@ const calcularValorEsperadoRetirada = async ({ movimentacaoAtual }) => {
   return calcularEsperadoMovimentacaoRetirada({
     movimentacaoAtual,
     valorFicha: valorJogada,
+    usaFichas: movimentacaoAtual?.maquina?.usaFichas === true,
     permitirFallbackDeltaOut: false,
   });
 };
@@ -225,7 +226,7 @@ export const listarFluxoCaixa = async (req, res) => {
                   ],
                 },
               ],
-              attributes: ["id", "nome", "codigo", "valorFicha", "lojaId"],
+              attributes: ["id", "nome", "codigo", "valorFicha", "usaFichas", "lojaId"],
             },
             {
               model: Usuario,
@@ -281,7 +282,7 @@ export const obterFluxoCaixa = async (req, res) => {
             {
               model: Maquina,
               as: "maquina",
-              attributes: ["id", "codigo", "nome", "valorFicha", "lojaId"],
+              attributes: ["id", "codigo", "nome", "valorFicha", "usaFichas", "lojaId"],
               include: [
                 {
                   model: Loja,
@@ -414,7 +415,7 @@ export const atualizarFluxoCaixa = async (req, res) => {
             {
               model: Maquina,
               as: "maquina",
-              attributes: ["id", "codigo", "nome", "valorFicha", "lojaId"],
+              attributes: ["id", "codigo", "nome", "valorFicha", "usaFichas", "lojaId"],
               include: [
                 {
                   model: Loja,
@@ -609,7 +610,7 @@ export const obterFluxoPorMovimentacao = async (req, res) => {
             {
               model: Maquina,
               as: "maquina",
-              attributes: ["id", "codigo", "nome", "valorFicha", "lojaId"],
+              attributes: ["id", "codigo", "nome", "valorFicha", "usaFichas", "lojaId"],
               include: [
                 {
                   model: Loja,

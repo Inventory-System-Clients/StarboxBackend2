@@ -149,6 +149,7 @@ export const calcularEsperadoComHistorico = ({
   movimentacaoAtual,
   historicoMovimentacoes,
   valorFicha,
+  usaFichas = false,
   contadorInAnteriorFallback = null,
   contadorOutAnteriorFallback = null,
   permitirFallbackDeltaOut = false,
@@ -222,13 +223,17 @@ export const calcularEsperadoComHistorico = ({
       ? Math.max(0, contadorOutAtual - baseOut)
       : null;
 
-  // Cada unidade do contador IN/OUT é 1 ficha jogada — o valor esperado em
-  // reais é o delta de fichas multiplicado pelo preço da ficha na máquina
-  // (valorFicha varia por loja/máquina, ex.: R$2,50 ou R$5,00). Se valorFicha
-  // não vier informado, mantém o delta bruto (multiplicador 1) em vez de
-  // zerar o valor.
+  // Em máquina de ficha (usaFichas=true), cada unidade do contador IN/OUT é 1
+  // ficha jogada — o valor esperado em reais é o delta de fichas multiplicado
+  // pelo preço da ficha (valorFicha varia por loja/máquina, ex.: R$2,50 ou
+  // R$5,00). Se valorFicha não vier informado, mantém o delta bruto
+  // (multiplicador 1) em vez de zerar o valor. Em máquina sem ficha
+  // (usaFichas=false, ex.: contador que já mede reais/jogadas diretamente),
+  // valorFicha não representa preço por unidade do contador — não multiplica.
   const precoFicha =
-    possuiNumero(valorFicha) && Number(valorFicha) > 0 ? Number(valorFicha) : 1;
+    usaFichas && possuiNumero(valorFicha) && Number(valorFicha) > 0
+      ? Number(valorFicha)
+      : 1;
 
   let valorEsperadoCalculado = null;
   let algoritmoValorEsperado = null;
@@ -254,6 +259,7 @@ export const calcularEsperadoComHistorico = ({
 export const calcularEsperadoMovimentacaoRetirada = async ({
   movimentacaoAtual,
   valorFicha,
+  usaFichas = false,
   contadorInAnteriorFallback = null,
   contadorOutAnteriorFallback = null,
   permitirFallbackDeltaOut = false,
@@ -295,6 +301,7 @@ export const calcularEsperadoMovimentacaoRetirada = async ({
     movimentacaoAtual: atual,
     historicoMovimentacoes: historico,
     valorFicha,
+    usaFichas,
     contadorInAnteriorFallback,
     contadorOutAnteriorFallback,
     permitirFallbackDeltaOut,
@@ -351,6 +358,7 @@ export const calcularEsperadoParaVariasMovimentacoes = async (
       movimentacaoAtual: atual,
       historicoMovimentacoes: historicoPorMaquina.get(atual.maquinaId) || [],
       valorFicha: decimalOuNull(atual.maquina?.valorFicha),
+      usaFichas: atual.maquina?.usaFichas === true,
       permitirFallbackDeltaOut: false,
     });
   });

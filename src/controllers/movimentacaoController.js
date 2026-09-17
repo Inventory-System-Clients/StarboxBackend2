@@ -110,6 +110,7 @@ const agoraSaoPaulo = () => {
 const calcularValorEsperadoInicialRetirada = async ({
   movimentacaoAtual,
   valorJogada,
+  usaFichas,
   contadorInAnteriorFallback,
   contadorOutAnteriorFallback,
   transaction,
@@ -117,6 +118,7 @@ const calcularValorEsperadoInicialRetirada = async ({
   const calculo = await calcularEsperadoMovimentacaoRetirada({
     movimentacaoAtual,
     valorFicha: valorJogada,
+    usaFichas,
     contadorInAnteriorFallback,
     contadorOutAnteriorFallback,
     permitirFallbackDeltaOut: false,
@@ -817,6 +819,7 @@ export const registrarMovimentacao = async (req, res) => {
         await calcularValorEsperadoInicialRetirada({
           movimentacaoAtual: movimentacao,
           valorJogada: maquina.valorFicha,
+          usaFichas: maquina.usaFichas === true,
           contadorInAnteriorFallback: contadorInAnteriorSanitizado,
           contadorOutAnteriorFallback: contadorOutAnteriorSanitizado,
           transaction,

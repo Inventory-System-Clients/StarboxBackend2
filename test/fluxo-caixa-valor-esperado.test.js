@@ -30,6 +30,7 @@ test("Cenario A: primeira via cadastro vira base da proxima movimentacao", () =>
     movimentacaoAtual: atual,
     historicoMovimentacoes: [atual, base],
     valorFicha: 2,
+    usaFichas: true,
     permitirFallbackDeltaOut: false,
   });
 
@@ -109,6 +110,7 @@ test("Quando contador anterior do payload vier nulo usa ultimo contador valido s
     movimentacaoAtual: historico[2],
     historicoMovimentacoes: historico,
     valorFicha: 2,
+    usaFichas: true,
     contadorInAnteriorFallback: null,
     permitirFallbackDeltaOut: false,
   });
@@ -144,6 +146,7 @@ test("Cenario C: usa coalesce de contador IN digital quando contador IN principa
     movimentacaoAtual: historico[1],
     historicoMovimentacoes: historico,
     valorFicha: 2,
+    usaFichas: true,
     permitirFallbackDeltaOut: false,
   });
 
@@ -178,6 +181,7 @@ test("Cenario D: contadorInAnterior da atual tem prioridade sobre historico", ()
     movimentacaoAtual: historico[1],
     historicoMovimentacoes: historico,
     valorFicha: 2,
+    usaFichas: true,
     contadorInAnteriorFallback: 1000,
     permitirFallbackDeltaOut: false,
   });
@@ -266,6 +270,7 @@ test("Multiplica o delta pelo valorFicha da maquina (R$2,50 e R$5,00 por loja)",
     movimentacaoAtual: historico[1],
     historicoMovimentacoes: historico,
     valorFicha: 2.5,
+    usaFichas: true,
     permitirFallbackDeltaOut: false,
   });
   assert.equal(calculoDoisEMeio.deltaContadorIn, 94);
@@ -276,12 +281,81 @@ test("Multiplica o delta pelo valorFicha da maquina (R$2,50 e R$5,00 por loja)",
     movimentacaoAtual: historico[1],
     historicoMovimentacoes: historico,
     valorFicha: 5,
+    usaFichas: true,
     permitirFallbackDeltaOut: false,
   });
   assert.equal(calculoCinco.valorEsperadoCalculado, 470);
 });
 
-test("Sem valorFicha informado, mantem o delta bruto (multiplicador 1) em vez de zerar", () => {
+test("Maquina sem ficha (usaFichas=false) nao multiplica, mesmo com valorFicha cadastrado", () => {
+  // Caso real de producao: maquinas 908/952 tem valorFicha=30 e usaFichas
+  // false — o contador delas nao representa "fichas jogadas", entao o valor
+  // esperado deve continuar sendo o delta bruto do contador, sem multiplicar.
+  const maquinaId = "maq-8";
+  const historico = [
+    {
+      id: "mov-1",
+      maquinaId,
+      dataColeta: "2026-09-01T10:00:00.000Z",
+      createdAt: "2026-09-01T10:00:00.000Z",
+      contadorIn: 1000,
+      contadorOut: 500,
+    },
+    {
+      id: "mov-2",
+      maquinaId,
+      dataColeta: "2026-09-02T10:00:00.000Z",
+      createdAt: "2026-09-02T10:00:00.000Z",
+      contadorIn: 1450,
+      contadorOut: 520,
+    },
+  ];
+
+  const calculo = calcularEsperadoComHistorico({
+    movimentacaoAtual: historico[1],
+    historicoMovimentacoes: historico,
+    valorFicha: 30,
+    usaFichas: false,
+    permitirFallbackDeltaOut: false,
+  });
+
+  assert.equal(calculo.deltaContadorIn, 450);
+  assert.equal(calculo.valorEsperadoCalculado, 450);
+});
+
+test("usaFichas nao informado (default) nao multiplica, igual ao comportamento anterior ao fix", () => {
+  const maquinaId = "maq-9";
+  const historico = [
+    {
+      id: "mov-1",
+      maquinaId,
+      dataColeta: "2026-09-01T10:00:00.000Z",
+      createdAt: "2026-09-01T10:00:00.000Z",
+      contadorIn: 1000,
+      contadorOut: 500,
+    },
+    {
+      id: "mov-2",
+      maquinaId,
+      dataColeta: "2026-09-02T10:00:00.000Z",
+      createdAt: "2026-09-02T10:00:00.000Z",
+      contadorIn: 1080,
+      contadorOut: 520,
+    },
+  ];
+
+  const calculo = calcularEsperadoComHistorico({
+    movimentacaoAtual: historico[1],
+    historicoMovimentacoes: historico,
+    valorFicha: 2.5,
+    permitirFallbackDeltaOut: false,
+  });
+
+  assert.equal(calculo.deltaContadorIn, 80);
+  assert.equal(calculo.valorEsperadoCalculado, 80);
+});
+
+test("Sem valorFicha informado em maquina de ficha, mantem o delta bruto (multiplicador 1) em vez de zerar", () => {
   const maquinaId = "maq-7";
   const historico = [
     {
@@ -306,6 +380,7 @@ test("Sem valorFicha informado, mantem o delta bruto (multiplicador 1) em vez de
     movimentacaoAtual: historico[1],
     historicoMovimentacoes: historico,
     valorFicha: null,
+    usaFichas: true,
     permitirFallbackDeltaOut: false,
   });
 

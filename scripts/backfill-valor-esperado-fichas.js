@@ -157,6 +157,7 @@ async function main() {
     const calculo = await calcularEsperadoMovimentacaoRetirada({
       movimentacaoAtual: movimentacao,
       valorFicha,
+      usaFichas: true, // já filtrado acima (usaFichas !== true é ignorado antes)
       permitirFallbackDeltaOut: false,
     });
 
