@@ -1,19 +1,26 @@
-// Script de diagnóstico/correção do bug de "Valor Esperado" descrito para o
-// cliente: calcularEsperadoComHistorico() (src/services/fluxoCaixaCalculoService.js)
-// calcula o valor esperado como o delta bruto do contador IN/OUT da máquina,
-// SEM multiplicar pelo valorFicha (preço em R$ de cada ficha). Esse valor
-// bugado foi salvo em `valor_esperado_movimentacao.valor_esperado`, que é a
-// tabela que os relatórios somam em "Valor Esperado (Fluxo de Caixa)".
+// Script de correção do bug de "Valor Esperado" descrito para o cliente:
+// calcularEsperadoComHistorico() (src/services/fluxoCaixaCalculoService.js)
+// calculava o valor esperado como o delta bruto do contador IN/OUT da
+// máquina, SEM multiplicar pelo valorFicha (preço em R$ de cada ficha). Esse
+// valor bugado foi salvo em `valor_esperado_movimentacao.valor_esperado`, que
+// é a tabela que os relatórios somam em "Valor Esperado (Fluxo de Caixa)".
+// A fórmula em fluxoCaixaCalculoService.js já foi corrigida (agora multiplica
+// por valorFicha) — este script corrige os registros que foram salvos ANTES
+// da correção.
 //
-// Este script recalcula, registro a registro, o valor que a fórmula (ainda
-// não corrigida) produziria hoje e compara com o que está salvo:
-//   - Se bater (dentro de 1 centavo) => o registro veio do caminho com bug
-//     (delta_in_direto / delta_out_direto). Valor corrigido = delta * valorFicha
-//     da máquina.
+// IMPORTANTE: este script chama a função JÁ CORRIGIDA
+// (calcularEsperadoMovimentacaoRetirada), que devolve tanto o delta bruto
+// (deltaContadorIn/deltaContadorOut, sem multiplicar) quanto o valor final já
+// multiplicado (valorEsperadoCalculado). Para cada registro:
+//   - Se o valor salvo bater com o DELTA BRUTO (sem multiplicar; dentro de 1
+//     centavo) => o registro veio do caminho com bug. Valor corrigido =
+//     calculo.valorEsperadoCalculado (já vem multiplicado pela função).
 //   - Se não bater => o registro provavelmente veio do fallback
 //     `movimentacao.valorFaturado` (que já multiplica fichas * valorFicha
-//     corretamente, ver movimentacaoController.js:709-712) ou foi alterado
-//     manualmente depois. Não mexemos nesses — só reportamos para checagem manual.
+//     corretamente, ver movimentacaoController.js:709-712), foi alterado
+//     manualmente depois, ou a base do contador mudou por uma edição
+//     retroativa de outra movimentação da mesma máquina. Não mexemos nesses
+//     — só reportamos para checagem manual.
 //
 // NÃO toca em `fluxo_caixa.valor_esperado` (tabela de conferência manual do
 // admin, ver MINI_PROMPT_VALOR_ESPERADO_EDITAVEL.md) — só corrige
@@ -51,8 +58,6 @@ const parseArgs = (argv) => {
   }
   return args;
 };
-
-const arredondar2 = (valor) => Number(Number(valor || 0).toFixed(2));
 
 const formatarMoeda = (valor) =>
   Number(valor || 0).toLocaleString("pt-BR", {
@@ -101,7 +106,13 @@ async function main() {
 
   for (const registro of registros) {
     const movimentacaoInstance = await Movimentacao.findByPk(registro.movimentacaoId, {
-      include: [{ model: Maquina, as: "maquina", attributes: ["id", "valorFicha", "codigo", "nome"] }],
+      include: [
+        {
+          model: Maquina,
+          as: "maquina",
+          attributes: ["id", "valorFicha", "usaFichas", "codigo", "nome"],
+        },
+      ],
     });
 
     if (!movimentacaoInstance || !movimentacaoInstance.maquina) {
@@ -118,16 +129,42 @@ async function main() {
     // antes de repassar, pra evitar depender de getters de instância do
     // Sequelize dentro de calcularEsperadoComHistorico.
     const movimentacao = movimentacaoInstance.toJSON();
+
+    // Máquinas com usaFichas=false não seguem o modelo "1 unidade do contador
+    // IN = 1 ficha jogada" — o campo valorFicha delas pode não representar
+    // preço por jogada (visto em produção: máquinas 908/952 com valorFicha=30
+    // e usaFichas=false, o que infla o valor esperado de forma implausível).
+    // Não aplicamos a fórmula de ficha nelas até confirmar com o cliente
+    // como o contador dessas máquinas deve ser interpretado.
+    if (movimentacao.maquina.usaFichas !== true) {
+      paraRevisar.push({
+        motivo: "Máquina com usaFichas=false — não corrigido automaticamente, confirmar com o cliente",
+        registroId: registro.id,
+        movimentacaoId: registro.movimentacaoId,
+        maquina: movimentacao.maquina.codigo || movimentacao.maquina.nome,
+        valorAtualSalvo: Number(registro.valorEsperado || 0),
+        valorFichaCadastrado: movimentacao.maquina.valorFicha,
+      });
+      totalIgnorados += 1;
+      continue;
+    }
+
     const valorFicha = Number(movimentacao.maquina.valorFicha || 0);
 
+    // calcularEsperadoMovimentacaoRetirada já está com o fix aplicado: devolve
+    // o delta bruto (sem multiplicar) em deltaContadorIn/deltaContadorOut, e o
+    // valor final já multiplicado por valorFicha em valorEsperadoCalculado.
     const calculo = await calcularEsperadoMovimentacaoRetirada({
       movimentacaoAtual: movimentacao,
-      valorFicha, // não usado internamente hoje (é o bug) — repassado por paridade
+      valorFicha,
       permitirFallbackDeltaOut: false,
     });
 
     const valorAtualSalvo = Number(registro.valorEsperado || 0);
-    const deltaBruto = calculo.valorEsperadoCalculado;
+    const deltaBruto =
+      calculo.algoritmoValorEsperado === "delta_out_direto"
+        ? calculo.deltaContadorOut
+        : calculo.deltaContadorIn;
 
     const vemDoCaminhoComBug =
       deltaBruto !== null &&
@@ -149,7 +186,7 @@ async function main() {
       continue;
     }
 
-    const valorCorrigido = arredondar2(deltaBruto * valorFicha);
+    const valorCorrigido = calculo.valorEsperadoCalculado;
     somaAntiga += valorAtualSalvo;
     somaNova += valorCorrigido;
     totalCorrigidos += 1;
@@ -185,6 +222,17 @@ async function main() {
   console.log(`Soma antiga: ${formatarMoeda(somaAntiga)}`);
   console.log(`Soma nova:   ${formatarMoeda(somaNova)}`);
   console.log(`Diferença:   ${formatarMoeda(somaNova - somaAntiga)}`);
+
+  if (paraCorrigir.length > 0) {
+    console.log(`\n=== Detalhe dos ${paraCorrigir.length} registro(s) a corrigir (ordenado por razão novo/antigo) ===`);
+    const comRazao = paraCorrigir
+      .map((item) => ({
+        ...item,
+        razao: item.valorAntigo > 0 ? item.valorNovo / item.valorAntigo : null,
+      }))
+      .sort((a, b) => (b.razao || 0) - (a.razao || 0));
+    console.table(comRazao);
+  }
 
   if (paraRevisar.length > 0) {
     console.log(`\n=== ${paraRevisar.length} registro(s) NÃO alterado(s) — revisar manualmente ===`);
