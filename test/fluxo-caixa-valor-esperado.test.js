@@ -35,7 +35,7 @@ test("Cenario A: primeira via cadastro vira base da proxima movimentacao", () =>
 
   assert.equal(calculo.ultimoContadorInRetirada, 1000);
   assert.equal(calculo.deltaContadorIn, 200);
-  assert.equal(calculo.valorEsperadoCalculado, 200);
+  assert.equal(calculo.valorEsperadoCalculado, 400);
   assert.equal(calculo.algoritmoValorEsperado, "delta_in_direto");
 });
 
@@ -115,7 +115,7 @@ test("Quando contador anterior do payload vier nulo usa ultimo contador valido s
 
   assert.equal(calculo.ultimoContadorInRetirada, 900);
   assert.equal(calculo.deltaContadorIn, 200);
-  assert.equal(calculo.valorEsperadoCalculado, 200);
+  assert.equal(calculo.valorEsperadoCalculado, 400);
 });
 
 test("Cenario C: usa coalesce de contador IN digital quando contador IN principal vier nulo", () => {
@@ -149,7 +149,7 @@ test("Cenario C: usa coalesce de contador IN digital quando contador IN principa
 
   assert.equal(calculo.ultimoContadorInRetirada, 1000);
   assert.equal(calculo.deltaContadorIn, 200);
-  assert.equal(calculo.valorEsperadoCalculado, 200);
+  assert.equal(calculo.valorEsperadoCalculado, 400);
 });
 
 test("Cenario D: contadorInAnterior da atual tem prioridade sobre historico", () => {
@@ -184,7 +184,7 @@ test("Cenario D: contadorInAnterior da atual tem prioridade sobre historico", ()
 
   assert.equal(calculo.ultimoContadorInRetirada, 1100);
   assert.equal(calculo.deltaContadorIn, 100);
-  assert.equal(calculo.valorEsperadoCalculado, 100);
+  assert.equal(calculo.valorEsperadoCalculado, 200);
 });
 
 test("Extrator de contador atual usa contador principal e fallback digital", () => {
@@ -237,4 +237,78 @@ test("Sem delta IN nao usa delta OUT quando fallback nao estiver habilitado", ()
 
   assert.equal(calculo.deltaContadorOut, 200);
   assert.equal(calculo.valorEsperadoCalculado, null);
+});
+
+test("Multiplica o delta pelo valorFicha da maquina (R$2,50 e R$5,00 por loja)", () => {
+  const maquinaId = "maq-6";
+  const historico = [
+    {
+      id: "mov-1",
+      maquinaId,
+      dataColeta: "2026-09-01T10:00:00.000Z",
+      createdAt: "2026-09-01T10:00:00.000Z",
+      contadorIn: 1000,
+      contadorOut: 500,
+    },
+    {
+      id: "mov-2",
+      maquinaId,
+      dataColeta: "2026-09-02T10:00:00.000Z",
+      createdAt: "2026-09-02T10:00:00.000Z",
+      contadorIn: 1094,
+      contadorOut: 540,
+    },
+  ];
+
+  // 94 fichas jogadas a R$2,50 cada = R$235,00 (mesmo valor da tela de
+  // "Leituras do Período" que o cliente reportou como divergente).
+  const calculoDoisEMeio = calcularEsperadoComHistorico({
+    movimentacaoAtual: historico[1],
+    historicoMovimentacoes: historico,
+    valorFicha: 2.5,
+    permitirFallbackDeltaOut: false,
+  });
+  assert.equal(calculoDoisEMeio.deltaContadorIn, 94);
+  assert.equal(calculoDoisEMeio.valorEsperadoCalculado, 235);
+
+  // Mesma máquina/delta, mas em uma loja com ficha a R$5,00.
+  const calculoCinco = calcularEsperadoComHistorico({
+    movimentacaoAtual: historico[1],
+    historicoMovimentacoes: historico,
+    valorFicha: 5,
+    permitirFallbackDeltaOut: false,
+  });
+  assert.equal(calculoCinco.valorEsperadoCalculado, 470);
+});
+
+test("Sem valorFicha informado, mantem o delta bruto (multiplicador 1) em vez de zerar", () => {
+  const maquinaId = "maq-7";
+  const historico = [
+    {
+      id: "mov-1",
+      maquinaId,
+      dataColeta: "2026-09-01T10:00:00.000Z",
+      createdAt: "2026-09-01T10:00:00.000Z",
+      contadorIn: 1000,
+      contadorOut: 500,
+    },
+    {
+      id: "mov-2",
+      maquinaId,
+      dataColeta: "2026-09-02T10:00:00.000Z",
+      createdAt: "2026-09-02T10:00:00.000Z",
+      contadorIn: 1050,
+      contadorOut: 520,
+    },
+  ];
+
+  const calculo = calcularEsperadoComHistorico({
+    movimentacaoAtual: historico[1],
+    historicoMovimentacoes: historico,
+    valorFicha: null,
+    permitirFallbackDeltaOut: false,
+  });
+
+  assert.equal(calculo.deltaContadorIn, 50);
+  assert.equal(calculo.valorEsperadoCalculado, 50);
 });

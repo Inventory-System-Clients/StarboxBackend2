@@ -222,14 +222,22 @@ export const calcularEsperadoComHistorico = ({
       ? Math.max(0, contadorOutAtual - baseOut)
       : null;
 
+  // Cada unidade do contador IN/OUT é 1 ficha jogada — o valor esperado em
+  // reais é o delta de fichas multiplicado pelo preço da ficha na máquina
+  // (valorFicha varia por loja/máquina, ex.: R$2,50 ou R$5,00). Se valorFicha
+  // não vier informado, mantém o delta bruto (multiplicador 1) em vez de
+  // zerar o valor.
+  const precoFicha =
+    possuiNumero(valorFicha) && Number(valorFicha) > 0 ? Number(valorFicha) : 1;
+
   let valorEsperadoCalculado = null;
   let algoritmoValorEsperado = null;
 
   if (deltaContadorIn !== null) {
-    valorEsperadoCalculado = arredondar2(deltaContadorIn);
+    valorEsperadoCalculado = arredondar2(deltaContadorIn * precoFicha);
     algoritmoValorEsperado = "delta_in_direto";
   } else if (permitirFallbackDeltaOut && deltaContadorOut !== null) {
-    valorEsperadoCalculado = arredondar2(deltaContadorOut);
+    valorEsperadoCalculado = arredondar2(deltaContadorOut * precoFicha);
     algoritmoValorEsperado = "delta_out_direto";
   }
 

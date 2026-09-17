@@ -670,13 +670,6 @@ router.patch(
       const { id: roteiroId } = req.params;
       const { lojaId, novaOrdem } = req.body;
 
-      const roteiroFinalizado = await roteiroFoiFinalizadoNoCicloAtual(roteiroId);
-      if (roteiroFinalizado) {
-        return res.status(409).json({
-          error: "Roteiro finalizado: não é permitido reordenar lojas.",
-        });
-      }
-
       if (lojaId == null || novaOrdem == null)
         return res
           .status(400)
