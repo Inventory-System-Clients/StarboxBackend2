@@ -515,19 +515,6 @@ router.post(
           .json({ error: "Roteiro de destino não encontrado" });
 
       await sequelize.transaction(async (t) => {
-        const destinoFinalizado = await roteiroFoiFinalizadoNoCicloAtual(
-          roteiroDestinoId,
-          t,
-        );
-        if (destinoFinalizado) {
-          throw Object.assign(
-            new Error(
-              "Roteiro de destino finalizado: não é permitido adicionar lojas.",
-            ),
-            { status: 409 },
-          );
-        }
-
         if (roteiroOrigemId) {
           const origemFinalizado = await roteiroFoiFinalizadoNoCicloAtual(
             roteiroOrigemId,
