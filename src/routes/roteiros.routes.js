@@ -623,14 +623,6 @@ router.delete(
     try {
       const { id: roteiroId, lojaId } = req.params;
 
-      const roteiroFinalizado =
-        await roteiroFoiFinalizadoNoCicloAtual(roteiroId);
-      if (roteiroFinalizado) {
-        return res.status(409).json({
-          error: "Roteiro finalizado: não é permitido remover lojas.",
-        });
-      }
-
       const relacaoAtual = await RoteiroLoja.findOne({
         where: { RoteiroId: roteiroId, LojaId: lojaId },
       });
