@@ -29,7 +29,7 @@ const normalizarStatus = (status) => {
 
 const includePadrao = [
   { model: Loja, as: "loja", attributes: ["id", "nome"] },
-  { model: Maquina, as: "maquina", attributes: ["id", "nome", "lojaId"] },
+  { model: Maquina, as: "maquina", attributes: ["id", "codigo", "nome", "lojaId"] },
   { model: Usuario, as: "funcionario", attributes: ["id", "nome", "email"] },
   { model: Usuario, as: "criadoPor", attributes: ["id", "nome", "email"] },
   { model: Usuario, as: "concluidoPor", attributes: ["id", "nome", "email"] },
