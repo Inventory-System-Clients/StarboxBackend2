@@ -1705,7 +1705,15 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
 
     const itens = [];
     for (const [, movsDaMaquina] of movimentacoesPorMaquina) {
-      const movComLeituraReal = movsDaMaquina.find(possuiLeituraReal);
+      // movsDaMaquina vem em updatedAt ASC e a janela cobre a execucao
+      // semanal inteira (varios dias). Se a maquina foi lida mais de uma vez
+      // na semana, a mensagem tem que usar a leitura MAIS RECENTE - com
+      // find() pegava a primeira (ex.: a de ontem) e a mensagem saia com os
+      // contadores do dia anterior, embora a movimentacao/estoque de hoje
+      // estivessem registrados certos.
+      const movComLeituraReal = [...movsDaMaquina]
+        .reverse()
+        .find(possuiLeituraReal);
 
       if (!movComLeituraReal) {
         // So tem movimentacao "em branco" (abastecimento extra) na janela -
