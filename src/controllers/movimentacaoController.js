@@ -1700,6 +1700,12 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       );
       resumo.nomeProdutoAbastecimentoExtra =
         movComExtra.resumoWhatsapp.nomeProdutoAbastecimentoExtra;
+      // A data do extra tem que acompanhar o extra que foi mesclado - o
+      // frontend usa esse campo pra nao mandar extra de outro dia na
+      // mensagem do abastecedor.
+      resumo.dataAbastecimentoExtra =
+        movComExtra.resumoWhatsapp?.dataAbastecimentoExtra ||
+        movComExtra.updatedAt;
       return { resumo, movComExtra };
     };
 
