@@ -49,14 +49,15 @@ export const listarCarrinho = async (req, res) => {
 export const adicionarAoCarrinho = async (req, res) => {
   try {
     const usuarioId = String(req.params.id);
-    const { pecaId, quantidade } = req.body;
+    const { pecaId } = req.body;
+    const quantidade = parseInt(req.body.quantidade, 10);
 
     console.log("[Carrinho] Dados recebidos para adicionar ao carrinho:", {
       usuarioId,
       body: req.body,
     });
 
-    if (!pecaId || !quantidade) {
+    if (!pecaId || !(quantidade > 0)) {
       return res.status(400).json({ error: "pecaId ou quantidade ausente" });
     }
 
@@ -147,14 +148,25 @@ export const removerDoCarrinho = async (req, res) => {
         return res.status(404).json({ error: "Peca nao encontrada" });
       }
 
-      peca.quantidade += item.quantidade;
+      // Quantidade opcional (?quantidade=N): remove parcialmente; sem ela, remove o item inteiro
+      const qtdSolicitada = parseInt(req.query.quantidade, 10);
+      const qtdRemover =
+        qtdSolicitada > 0 ? Math.min(qtdSolicitada, item.quantidade) : item.quantidade;
+
+      peca.quantidade += qtdRemover;
       await peca.save({ transaction });
-      await item.destroy({ transaction });
+      if (qtdRemover >= item.quantidade) {
+        await item.destroy({ transaction });
+      } else {
+        item.quantidade -= qtdRemover;
+        await item.save({ transaction });
+      }
       await transaction.commit();
 
       console.log("[Carrinho] Item removido e estoque devolvido:", {
         usuarioId,
         pecaId,
+        quantidade: qtdRemover,
       });
       res.json({ success: true });
     } catch (error) {
