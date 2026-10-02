@@ -1708,13 +1708,31 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
 
       // Pode existir mais de uma movimentacao "em branco" com abastecimento
       // extra mais novo que a leitura (ex.: abastecedor reforcou o produto
-      // mais de uma vez depois da ultima leitura de contador) - soma todas
-      // elas. O extra que ja estava "colado" na leitura NAO entra nessa
+      // mais de uma vez depois da ultima leitura de contador) - soma as do
+      // mesmo dia. O extra que ja estava "colado" na leitura NAO entra nessa
       // soma: ele e mais antigo que os candidatos aqui (filtro acima) e,
       // assim como o resto do resumo, ja se refere a um abastecimento
       // separado/ja concluido - somar de novo faria dobrar a quantidade.
+      // So soma os extras do MESMO DIA do mais recente: a leitura de contador
+      // pode ser de semanas atras, entao um extra de segunda (+10) e outro de
+      // hoje (+8) passavam os dois no filtro acima e a mensagem de hoje saia
+      // com +18, embora hoje so tenham sido abastecidos 8.
+      const timestampExtra = (mov) =>
+        new Date(
+          mov.resumoWhatsapp?.dataAbastecimentoExtra || mov.updatedAt,
+        ).getTime();
+      movsComExtra.sort((a, b) => timestampExtra(a) - timestampExtra(b));
       const movComExtra = movsComExtra[movsComExtra.length - 1];
-      resumo.quantidadeAbastecimentoExtra = movsComExtra.reduce(
+      const diaDoExtraMaisRecente = new Date(
+        timestampExtra(movComExtra),
+      ).toDateString();
+      resumo.quantidadeAbastecimentoExtra = movsComExtra
+        .filter(
+          (mov) =>
+            new Date(timestampExtra(mov)).toDateString() ===
+            diaDoExtraMaisRecente,
+        )
+        .reduce(
         (soma, mov) =>
           soma + Number(mov.resumoWhatsapp?.quantidadeAbastecimentoExtra || 0),
         0,
