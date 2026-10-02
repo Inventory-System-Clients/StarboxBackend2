@@ -1,5 +1,6 @@
 import { EstoqueLoja, Loja, Produto } from "../models/index.js";
 import AlertManager from "../services/alertManager.js";
+import { registrarHistoricoEstoqueLoja } from "../utils/historicoEstoqueLoja.js";
 
 const dispararAlertaEstoqueCriticoLoja = async ({
   loja,
@@ -484,6 +485,7 @@ export const atualizarVariosEstoques = async (req, res) => {
 
     const resultados = [];
     const erros = [];
+    const itensHistorico = [];
 
     for (const item of estoques) {
       const { produtoId, quantidade, estoqueMinimo } = item;
@@ -519,6 +521,14 @@ export const atualizarVariosEstoques = async (req, res) => {
             estoque.estoqueMinimo = estoqueMinimo;
           }
           await estoque.save();
+
+          if (diferenca !== 0) {
+            itensHistorico.push({
+              produtoId,
+              quantidade: Math.abs(diferenca),
+              tipoMovimentacao: diferenca > 0 ? "entrada" : "saida",
+            });
+          }
 
           console.log(`Estoque atualizado:`, {
             produtoId,
@@ -556,6 +566,12 @@ export const atualizarVariosEstoques = async (req, res) => {
             console.log(`✅ Estoque depósito atualizado: ${estoqueDeposito.quantidade} → ${novaQtdDeposito}`);
           }
         } else {
+          itensHistorico.push({
+            produtoId,
+            quantidade: Number(quantidade),
+            tipoMovimentacao: "entrada",
+          });
+
           console.log(`Estoque criado:`, {
             produtoId,
             quantidade: estoque.quantidade,
@@ -605,6 +621,17 @@ export const atualizarVariosEstoques = async (req, res) => {
       `Processados: ${resultados.length} sucessos, ${erros.length} erros`,
     );
 
+    try {
+      await registrarHistoricoEstoqueLoja({
+        lojaId,
+        usuarioId: req.usuario?.id,
+        observacao: "Ajuste manual na tela Estoque Loja",
+        itens: itensHistorico,
+      });
+    } catch (historicoError) {
+      console.error("Erro ao registrar histórico do estoque da loja:", historicoError);
+    }
+
     res.json({
       message: `${resultados.length} estoques atualizados com sucesso`,
       estoques: resultados,
@@ -632,7 +659,19 @@ export const deletarEstoqueLoja = async (req, res) => {
       return res.status(404).json({ error: "Estoque não encontrado" });
     }
 
+    const quantidadeRemovida = Number(estoque.quantidade || 0);
     await estoque.destroy();
+
+    try {
+      await registrarHistoricoEstoqueLoja({
+        lojaId,
+        usuarioId: req.usuario?.id,
+        observacao: "Produto removido do estoque da loja",
+        itens: [{ produtoId, quantidade: quantidadeRemovida, tipoMovimentacao: "saida" }],
+      });
+    } catch (historicoError) {
+      console.error("Erro ao registrar histórico do estoque da loja:", historicoError);
+    }
 
     res.json({ message: "Estoque removido com sucesso" });
   } catch (error) {

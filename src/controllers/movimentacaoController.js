@@ -23,6 +23,7 @@ import { randomUUID } from "node:crypto";
 import { registrarMovimentacaoPecas } from "./movimentacaoPecaController.js";
 import justificativasPendentes from "../utils/justificativasPendentes.js";
 import AlertManager from "../services/alertManager.js";
+import { registrarHistoricoEstoqueLoja } from "../utils/historicoEstoqueLoja.js";
 import { verificarMediaJogadasForaPadrao } from "../services/alertaMediaFichasService.js";
 import { calcularEsperadoMovimentacaoRetirada } from "../services/fluxoCaixaCalculoService.js";
 import { registrarMaquinaConcluidaNaExecucao } from "../utils/roteiroStatusSemanal.js";
@@ -877,6 +878,7 @@ export const registrarMovimentacao = async (req, res) => {
     });
 
     const produtoIdsAjustadosNoEstoqueLoja = new Set();
+    const itensHistoricoEstoqueLoja = [];
 
     // Se produtos foram informados, registrar detalhes
     if (produtos && produtos.length > 0) {
@@ -924,6 +926,7 @@ export const registrarMovimentacao = async (req, res) => {
               });
 
               if (estoqueLoja) {
+                const quantidadeAnteriorLoja = estoqueLoja.quantidade;
                 const novaQuantidade = Math.max(
                   0,
                   estoqueLoja.quantidade - produto.quantidadeAbastecida,
@@ -933,6 +936,11 @@ export const registrarMovimentacao = async (req, res) => {
                   { transaction },
                 );
                 produtoIdsAjustadosNoEstoqueLoja.add(produto.produtoId);
+                itensHistoricoEstoqueLoja.push({
+                  produtoId: produto.produtoId,
+                  quantidade: quantidadeAnteriorLoja - novaQuantidade,
+                  tipoMovimentacao: "saida",
+                });
               }
             } else {
               const estoqueUsuario = await EstoqueUsuario.findOne({
@@ -985,6 +993,11 @@ export const registrarMovimentacao = async (req, res) => {
             { transaction },
           );
           produtoIdsAjustadosNoEstoqueLoja.add(produto.produtoId);
+          itensHistoricoEstoqueLoja.push({
+            produtoId: produto.produtoId,
+            quantidade: produto.retiradaProduto,
+            tipoMovimentacao: "entrada",
+          });
           console.log(
             "✅ [registrarMovimentacao] Devolução: retirada devolvida ao estoque da loja:",
             {
@@ -1005,6 +1018,14 @@ export const registrarMovimentacao = async (req, res) => {
         }
       }
     }
+
+    await registrarHistoricoEstoqueLoja({
+      lojaId: maquina.lojaId,
+      usuarioId: req.usuario?.id,
+      observacao: `Movimentação da máquina ${maquina.nome || maquina.codigo || maquina.id}`,
+      itens: itensHistoricoEstoqueLoja,
+      transaction,
+    });
 
     await transaction.commit();
     transaction = null;

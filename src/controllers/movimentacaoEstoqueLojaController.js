@@ -6,11 +6,32 @@ import MovimentacaoEstoqueLoja from "../models/MovimentacaoEstoqueLoja.js";
 import MovimentacaoEstoqueLojaProduto from "../models/MovimentacaoEstoqueLojaProduto.js";
 import { Loja, Usuario, Produto } from "../models/index.js";
 import { sequelize } from "../database/connection.js"; // Importe o sequelize para transações
+import { Op } from "sequelize";
 
 // 1. Listar todas as movimentações
 export const listarMovimentacoesEstoqueLoja = async (req, res) => {
   try {
+    const { lojaId, limite, dataInicio, dataFim } = req.query;
+    const limiteNumero = Number(limite);
+
+    // dataInicio/dataFim chegam como ISO (o frontend já converte o dia local)
+    const where = {};
+    if (lojaId) where.lojaId = lojaId;
+    const inicio = dataInicio ? new Date(dataInicio) : null;
+    const fim = dataFim ? new Date(dataFim) : null;
+    if (inicio && !Number.isNaN(inicio.getTime())) {
+      where.dataMovimentacao = { ...where.dataMovimentacao, [Op.gte]: inicio };
+    }
+    if (fim && !Number.isNaN(fim.getTime())) {
+      where.dataMovimentacao = { ...where.dataMovimentacao, [Op.lte]: fim };
+    }
+
     const movimentacoes = await MovimentacaoEstoqueLoja.findAll({
+      where,
+      limit:
+        Number.isInteger(limiteNumero) && limiteNumero > 0
+          ? Math.min(limiteNumero, 1000)
+          : undefined,
       order: [["dataMovimentacao", "DESC"]],
       include: [
         { model: Loja, as: "loja", attributes: ["id", "nome"] },
@@ -19,7 +40,11 @@ export const listarMovimentacoesEstoqueLoja = async (req, res) => {
           model: MovimentacaoEstoqueLojaProduto,
           as: "produtosEnviados",
           include: [
-            { model: Produto, as: "produto", attributes: ["id", "nome"] },
+            {
+              model: Produto,
+              as: "produto",
+              attributes: ["id", "nome", "codigo", "emoji"],
+            },
           ],
         },
       ],
