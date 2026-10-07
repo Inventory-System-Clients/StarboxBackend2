@@ -9,6 +9,7 @@ import {
   listarMovimentacoesEstoqueUsuario,
   movimentarEstoqueUsuario,
   transferirEstoqueUsuario,
+  listarLojasDestinoTransferencia,
   criarOuAtualizarProdutoEstoqueUsuario,
   atualizarEstoqueUsuario,
   atualizarVariosEstoquesUsuario,
@@ -44,6 +45,13 @@ router.get(
 
 router.get("/:usuarioId/alertas", autenticar, listarAlertasEstoqueUsuario);
 router.get("/:usuarioId", autenticar, listarEstoqueUsuario);
+
+router.get(
+  "/transferir/lojas",
+  autenticar,
+  autorizar(["ADMIN", "CONTROLADOR_ESTOQUE"]),
+  listarLojasDestinoTransferencia,
+);
 
 router.post(
   "/transferir",

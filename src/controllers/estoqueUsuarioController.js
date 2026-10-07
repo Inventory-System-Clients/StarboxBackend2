@@ -1,6 +1,10 @@
 import { Op } from "sequelize";
 import {
+  EstoqueLoja,
   EstoqueUsuario,
+  Loja,
+  MovimentacaoEstoqueLoja,
+  MovimentacaoEstoqueLojaProduto,
   MovimentacaoEstoqueUsuario,
   Produto,
   Usuario,
@@ -239,6 +243,16 @@ export const listarUsuariosDisponiveisEstoque = async (req, res) => {
   }
 };
 
+// Aceita "YYYY-MM-DD" (dia local inteiro) ou um ISO completo.
+const parseDataFiltro = (valor, fimDoDia) => {
+  if (!valor) return null;
+  const texto = String(valor);
+  const data = /^\d{4}-\d{2}-\d{2}$/.test(texto)
+    ? new Date(`${texto}T${fimDoDia ? "23:59:59.999" : "00:00:00"}`)
+    : new Date(texto);
+  return Number.isNaN(data.getTime()) ? undefined : data;
+};
+
 export const listarMovimentacoesEstoqueUsuario = async (req, res) => {
   try {
     if (!podeGerenciarTodosEstoques(req.usuario)) {
@@ -254,44 +268,29 @@ export const listarMovimentacoesEstoqueUsuario = async (req, res) => {
       return res.json([]);
     }
 
-    // Modo "últimas N movimentações" — usado pelo mini-histórico no card do
-    // usuário, sem exigir filtro de data. Sem `limit`, mantém a regra do
-    // front original: sem dataInicio/dataFim completos nao deve aparecer nada.
-    const limiteNumerico = Math.min(Math.max(parseInt(limit, 10) || 0, 0), 50);
+    const inicio = parseDataFiltro(dataInicio, false);
+    const fim = parseDataFiltro(dataFim, true);
 
-    if ((!dataInicio || !dataFim) && limiteNumerico > 0) {
-      const usuarioParaLimite = await buscarUsuario(usuarioId);
-      if (!usuarioParaLimite) {
-        return res.status(404).json({ error: "Usuario nao encontrado" });
-      }
-
-      const movimentacoesRecentes = await MovimentacaoEstoqueUsuario.findAll({
-        where: { usuarioId },
-        include: [
-          {
-            model: Usuario,
-            as: "usuario",
-            attributes: ["id", "nome", "email", "role"],
-          },
-          {
-            model: Usuario,
-            as: "lancadoPor",
-            attributes: ["id", "nome", "email", "role"],
-          },
-          {
-            model: Produto,
-            as: "produto",
-            attributes: ["id", "nome", "codigo", "emoji"],
-          },
-        ],
-        order: [["dataMovimentacao", "DESC"]],
-        limit: limiteNumerico,
+    if (inicio === undefined || fim === undefined) {
+      return res.status(400).json({
+        error: "dataInicio e dataFim devem ser datas validas (YYYY-MM-DD)",
       });
-
-      return res.json(movimentacoesRecentes);
     }
 
-    if (!dataInicio || !dataFim) {
+    if (inicio && fim && inicio > fim) {
+      return res.status(400).json({
+        error: "dataInicio nao pode ser maior que dataFim",
+      });
+    }
+
+    const limiteNumerico = Math.min(
+      Math.max(parseInt(limit, 10) || 0, 0),
+      1000,
+    );
+
+    // Sem filtro de data e sem limite nao retorna nada (evita varrer o
+    // historico inteiro sem querer).
+    if (!inicio && !fim && limiteNumerico === 0) {
       return res.json([]);
     }
 
@@ -300,28 +299,16 @@ export const listarMovimentacoesEstoqueUsuario = async (req, res) => {
       return res.status(404).json({ error: "Usuario nao encontrado" });
     }
 
-    const inicio = new Date(`${dataInicio}T00:00:00`);
-    const fim = new Date(`${dataFim}T23:59:59.999`);
-
-    if (Number.isNaN(inicio.getTime()) || Number.isNaN(fim.getTime())) {
-      return res.status(400).json({
-        error: "dataInicio e dataFim devem estar no formato YYYY-MM-DD",
-      });
-    }
-
-    if (inicio > fim) {
-      return res.status(400).json({
-        error: "dataInicio nao pode ser maior que dataFim",
-      });
+    const where = { usuarioId };
+    if (inicio || fim) {
+      where.dataMovimentacao = {
+        ...(inicio ? { [Op.gte]: inicio } : {}),
+        ...(fim ? { [Op.lte]: fim } : {}),
+      };
     }
 
     const movimentacoes = await MovimentacaoEstoqueUsuario.findAll({
-      where: {
-        usuarioId,
-        dataMovimentacao: {
-          [Op.between]: [inicio, fim],
-        },
-      },
+      where,
       include: [
         {
           model: Usuario,
@@ -340,7 +327,7 @@ export const listarMovimentacoesEstoqueUsuario = async (req, res) => {
         },
       ],
       order: [["dataMovimentacao", "DESC"]],
-      limit: 500,
+      limit: limiteNumerico || 500,
     });
 
     return res.json(movimentacoes);
@@ -855,49 +842,106 @@ export const movimentarEstoqueUsuario = async (req, res) => {
   }
 };
 
-// Transfere quantidade de um produto direto do estoque de um usuario para
-// outro. Nao mexe no deposito principal (diferente de /movimentar).
+// Lojas que aparecem como destino na transferencia de estoque do usuario
+// (busca pelo nome da loja).
+const LOJAS_DESTINO_TRANSFERENCIA = ["osasco"];
+
+const buscarLojasDestinoTransferencia = () =>
+  Loja.findAll({
+    where: {
+      ativo: true,
+      [Op.or]: LOJAS_DESTINO_TRANSFERENCIA.map((nome) => ({
+        nome: { [Op.iLike]: `%${nome}%` },
+      })),
+    },
+    attributes: ["id", "nome"],
+    order: [["nome", "ASC"]],
+  });
+
+export const listarLojasDestinoTransferencia = async (req, res) => {
+  try {
+    return res.json(await buscarLojasDestinoTransferencia());
+  } catch (error) {
+    console.error("Erro ao listar lojas de destino:", error);
+    return res.status(500).json({ error: "Erro ao listar lojas" });
+  }
+};
+
+// Transfere quantidade de um produto do estoque de um usuario para outro
+// usuario OU para o estoque de uma loja permitida (ex.: Osasco). Nao mexe no
+// deposito principal (diferente de /movimentar).
 export const transferirEstoqueUsuario = async (req, res) => {
-  const { usuarioOrigemId, usuarioDestinoId, produtoId, quantidade } =
-    req.body || {};
+  const {
+    usuarioOrigemId,
+    usuarioDestinoId,
+    lojaDestinoId,
+    produtoId,
+    quantidade,
+  } = req.body || {};
   const quantidadeNumerica = Number(quantidade);
 
-  if (!usuarioOrigemId || !usuarioDestinoId || !produtoId) {
+  if (!usuarioOrigemId || !produtoId) {
+    return res
+      .status(400)
+      .json({ error: "usuarioOrigemId e produtoId sao obrigatorios" });
+  }
+
+  if (Boolean(usuarioDestinoId) === Boolean(lojaDestinoId)) {
     return res.status(400).json({
-      error: "usuarioOrigemId, usuarioDestinoId e produtoId sao obrigatorios",
+      error: "Informe o destino: usuarioDestinoId ou lojaDestinoId",
     });
   }
 
-  if (String(usuarioOrigemId) === String(usuarioDestinoId)) {
+  if (
+    usuarioDestinoId &&
+    String(usuarioOrigemId) === String(usuarioDestinoId)
+  ) {
     return res
       .status(400)
       .json({ error: "Origem e destino devem ser usuarios diferentes" });
   }
 
-  if (!Number.isFinite(quantidadeNumerica) || quantidadeNumerica <= 0) {
+  if (!Number.isInteger(quantidadeNumerica) || quantidadeNumerica <= 0) {
     return res
       .status(400)
-      .json({ error: "Quantidade deve ser um numero maior que zero" });
+      .json({ error: "Quantidade deve ser um numero inteiro maior que zero" });
+  }
+
+  const [usuarioOrigem, produto] = await Promise.all([
+    buscarUsuario(usuarioOrigemId),
+    buscarProduto(produtoId),
+  ]);
+  if (!usuarioOrigem) {
+    return res.status(404).json({ error: "Usuario de origem nao encontrado" });
+  }
+  if (!produto) {
+    return res.status(404).json({ error: "Produto nao encontrado" });
+  }
+
+  let usuarioDestino = null;
+  let lojaDestino = null;
+  if (usuarioDestinoId) {
+    usuarioDestino = await buscarUsuario(usuarioDestinoId);
+    if (!usuarioDestino) {
+      return res
+        .status(404)
+        .json({ error: "Usuario de destino nao encontrado" });
+    }
+  } else {
+    const lojasPermitidas = await buscarLojasDestinoTransferencia();
+    lojaDestino = lojasPermitidas.find(
+      (loja) => String(loja.id) === String(lojaDestinoId),
+    );
+    if (!lojaDestino) {
+      return res
+        .status(400)
+        .json({ error: "Loja de destino nao permitida para transferencia" });
+    }
   }
 
   const transaction = await EstoqueUsuario.sequelize.transaction();
 
   try {
-    const [usuarioOrigem, usuarioDestino, produto] = await Promise.all([
-      buscarUsuario(usuarioOrigemId),
-      buscarUsuario(usuarioDestinoId),
-      buscarProduto(produtoId),
-    ]);
-
-    if (!usuarioOrigem || !usuarioDestino) {
-      await transaction.rollback();
-      return res.status(404).json({ error: "Usuario nao encontrado" });
-    }
-    if (!produto) {
-      await transaction.rollback();
-      return res.status(404).json({ error: "Produto nao encontrado" });
-    }
-
     const estoqueOrigem = await EstoqueUsuario.findOne({
       where: { usuarioId: usuarioOrigemId, produtoId },
       transaction,
@@ -912,64 +956,120 @@ export const transferirEstoqueUsuario = async (req, res) => {
       });
     }
 
-    const [estoqueDestino, createdDestino] = await EstoqueUsuario.findOrCreate({
-      where: { usuarioId: usuarioDestinoId, produtoId },
-      defaults: {
-        quantidade: 0,
-        estoqueMinimo: Number(produto.estoqueMinimo || 0),
-        ativo: true,
-      },
-      transaction,
-      lock: transaction.LOCK.UPDATE,
-    });
-
-    const saldoDestinoAnterior = createdDestino
-      ? 0
-      : Number(estoqueDestino.quantidade || 0);
     const saldoOrigemAtual = saldoOrigemAnterior - quantidadeNumerica;
-    const saldoDestinoAtual = saldoDestinoAnterior + quantidadeNumerica;
-
     estoqueOrigem.quantidade = saldoOrigemAtual;
     await estoqueOrigem.save({ transaction });
 
-    estoqueDestino.quantidade = saldoDestinoAtual;
-    estoqueDestino.ativo = true;
-    await estoqueDestino.save({ transaction });
+    const registrosHistorico = [
+      {
+        usuarioId: usuarioOrigemId,
+        lancadoPorId: req.usuario.id,
+        produtoId,
+        tipoMovimentacao: "saida",
+        quantidade: quantidadeNumerica,
+        quantidadeAnterior: saldoOrigemAnterior,
+        quantidadeAtual: saldoOrigemAtual,
+      },
+    ];
 
-    await MovimentacaoEstoqueUsuario.bulkCreate(
-      [
-        {
-          usuarioId: usuarioOrigemId,
-          lancadoPorId: req.usuario.id,
-          produtoId,
-          tipoMovimentacao: "saida",
-          quantidade: quantidadeNumerica,
-          quantidadeAnterior: saldoOrigemAnterior,
-          quantidadeAtual: saldoOrigemAtual,
+    let destinoInfo;
+
+    if (usuarioDestino) {
+      const [estoqueDestino, createdDestino] =
+        await EstoqueUsuario.findOrCreate({
+          where: { usuarioId: usuarioDestinoId, produtoId },
+          defaults: {
+            quantidade: 0,
+            estoqueMinimo: Number(produto.estoqueMinimo || 0),
+            ativo: true,
+          },
+          transaction,
+          lock: transaction.LOCK.UPDATE,
+        });
+
+      const saldoDestinoAnterior = createdDestino
+        ? 0
+        : Number(estoqueDestino.quantidade || 0);
+      const saldoDestinoAtual = saldoDestinoAnterior + quantidadeNumerica;
+
+      estoqueDestino.quantidade = saldoDestinoAtual;
+      estoqueDestino.ativo = true;
+      await estoqueDestino.save({ transaction });
+
+      registrosHistorico.push({
+        usuarioId: usuarioDestinoId,
+        lancadoPorId: req.usuario.id,
+        produtoId,
+        tipoMovimentacao: "entrada",
+        quantidade: quantidadeNumerica,
+        quantidadeAnterior: saldoDestinoAnterior,
+        quantidadeAtual: saldoDestinoAtual,
+      });
+
+      destinoInfo = {
+        nome: usuarioDestino.nome,
+        usuarioId: usuarioDestinoId,
+        quantidade: saldoDestinoAtual,
+      };
+    } else {
+      const [estoqueLoja] = await EstoqueLoja.findOrCreate({
+        where: { lojaId: lojaDestino.id, produtoId },
+        defaults: {
+          quantidade: 0,
+          estoqueMinimo: Number(produto.estoqueMinimo || 0),
+          ativo: true,
         },
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+
+      const saldoLojaAtual =
+        Number(estoqueLoja.quantidade || 0) + quantidadeNumerica;
+      estoqueLoja.quantidade = saldoLojaAtual;
+      estoqueLoja.ativo = true;
+      await estoqueLoja.save({ transaction });
+
+      // Registra a entrada no historico de movimentacoes da loja.
+      const movimentacaoLoja = await MovimentacaoEstoqueLoja.create(
         {
-          usuarioId: usuarioDestinoId,
-          lancadoPorId: req.usuario.id,
+          lojaId: lojaDestino.id,
+          usuarioId: req.usuario.id,
+          observacao: `Transferencia do estoque de ${usuarioOrigem.nome}`,
+          dataMovimentacao: new Date(),
+        },
+        { transaction },
+      );
+      await MovimentacaoEstoqueLojaProduto.create(
+        {
+          movimentacaoEstoqueLojaId: movimentacaoLoja.id,
           produtoId,
+          quantidade: quantidadeNumerica,
           tipoMovimentacao: "entrada",
-          quantidade: quantidadeNumerica,
-          quantidadeAnterior: saldoDestinoAnterior,
-          quantidadeAtual: saldoDestinoAtual,
         },
-      ],
-      { transaction },
-    );
+        { transaction },
+      );
+
+      destinoInfo = {
+        nome: lojaDestino.nome,
+        lojaId: lojaDestino.id,
+        quantidade: saldoLojaAtual,
+      };
+    }
+
+    await MovimentacaoEstoqueUsuario.bulkCreate(registrosHistorico, {
+      transaction,
+    });
 
     await transaction.commit();
 
     return res.json({
-      message: `${quantidadeNumerica} ${produto.nome} transferido(s) de ${usuarioOrigem.nome} para ${usuarioDestino.nome}`,
+      message: `${quantidadeNumerica} ${produto.nome} transferido(s) de ${usuarioOrigem.nome} para ${destinoInfo.nome}`,
       origem: { usuarioId: usuarioOrigemId, quantidade: saldoOrigemAtual },
-      destino: { usuarioId: usuarioDestinoId, quantidade: saldoDestinoAtual },
+      destino: destinoInfo,
     });
   } catch (error) {
     await transaction.rollback();
-    console.error("Erro ao transferir estoque entre usuarios:", error);
+    console.error("Erro ao transferir estoque do usuario:", error);
     return res.status(500).json({ error: "Erro ao transferir estoque" });
   }
 };
