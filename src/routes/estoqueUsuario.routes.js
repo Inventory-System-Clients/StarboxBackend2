@@ -8,6 +8,7 @@ import {
   listarUsuariosDisponiveisEstoque,
   listarMovimentacoesEstoqueUsuario,
   movimentarEstoqueUsuario,
+  transferirEstoqueUsuario,
   criarOuAtualizarProdutoEstoqueUsuario,
   atualizarEstoqueUsuario,
   atualizarVariosEstoquesUsuario,
@@ -43,6 +44,14 @@ router.get(
 
 router.get("/:usuarioId/alertas", autenticar, listarAlertasEstoqueUsuario);
 router.get("/:usuarioId", autenticar, listarEstoqueUsuario);
+
+router.post(
+  "/transferir",
+  autenticar,
+  autorizar(["ADMIN", "CONTROLADOR_ESTOQUE"]),
+  registrarLog("TRANSFERIR_ESTOQUE_USUARIO", "EstoqueUsuario"),
+  transferirEstoqueUsuario,
+);
 
 router.post(
   "/:usuarioId/varios",

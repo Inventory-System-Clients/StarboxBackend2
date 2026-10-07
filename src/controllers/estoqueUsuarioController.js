@@ -855,6 +855,125 @@ export const movimentarEstoqueUsuario = async (req, res) => {
   }
 };
 
+// Transfere quantidade de um produto direto do estoque de um usuario para
+// outro. Nao mexe no deposito principal (diferente de /movimentar).
+export const transferirEstoqueUsuario = async (req, res) => {
+  const { usuarioOrigemId, usuarioDestinoId, produtoId, quantidade } =
+    req.body || {};
+  const quantidadeNumerica = Number(quantidade);
+
+  if (!usuarioOrigemId || !usuarioDestinoId || !produtoId) {
+    return res.status(400).json({
+      error: "usuarioOrigemId, usuarioDestinoId e produtoId sao obrigatorios",
+    });
+  }
+
+  if (String(usuarioOrigemId) === String(usuarioDestinoId)) {
+    return res
+      .status(400)
+      .json({ error: "Origem e destino devem ser usuarios diferentes" });
+  }
+
+  if (!Number.isFinite(quantidadeNumerica) || quantidadeNumerica <= 0) {
+    return res
+      .status(400)
+      .json({ error: "Quantidade deve ser um numero maior que zero" });
+  }
+
+  const transaction = await EstoqueUsuario.sequelize.transaction();
+
+  try {
+    const [usuarioOrigem, usuarioDestino, produto] = await Promise.all([
+      buscarUsuario(usuarioOrigemId),
+      buscarUsuario(usuarioDestinoId),
+      buscarProduto(produtoId),
+    ]);
+
+    if (!usuarioOrigem || !usuarioDestino) {
+      await transaction.rollback();
+      return res.status(404).json({ error: "Usuario nao encontrado" });
+    }
+    if (!produto) {
+      await transaction.rollback();
+      return res.status(404).json({ error: "Produto nao encontrado" });
+    }
+
+    const estoqueOrigem = await EstoqueUsuario.findOne({
+      where: { usuarioId: usuarioOrigemId, produtoId },
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+
+    const saldoOrigemAnterior = Number(estoqueOrigem?.quantidade || 0);
+    if (!estoqueOrigem || quantidadeNumerica > saldoOrigemAnterior) {
+      await transaction.rollback();
+      return res.status(400).json({
+        error: `Estoque insuficiente de ${produto.nome} com ${usuarioOrigem.nome}. Disponivel: ${saldoOrigemAnterior}`,
+      });
+    }
+
+    const [estoqueDestino, createdDestino] = await EstoqueUsuario.findOrCreate({
+      where: { usuarioId: usuarioDestinoId, produtoId },
+      defaults: {
+        quantidade: 0,
+        estoqueMinimo: Number(produto.estoqueMinimo || 0),
+        ativo: true,
+      },
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+
+    const saldoDestinoAnterior = createdDestino
+      ? 0
+      : Number(estoqueDestino.quantidade || 0);
+    const saldoOrigemAtual = saldoOrigemAnterior - quantidadeNumerica;
+    const saldoDestinoAtual = saldoDestinoAnterior + quantidadeNumerica;
+
+    estoqueOrigem.quantidade = saldoOrigemAtual;
+    await estoqueOrigem.save({ transaction });
+
+    estoqueDestino.quantidade = saldoDestinoAtual;
+    estoqueDestino.ativo = true;
+    await estoqueDestino.save({ transaction });
+
+    await MovimentacaoEstoqueUsuario.bulkCreate(
+      [
+        {
+          usuarioId: usuarioOrigemId,
+          lancadoPorId: req.usuario.id,
+          produtoId,
+          tipoMovimentacao: "saida",
+          quantidade: quantidadeNumerica,
+          quantidadeAnterior: saldoOrigemAnterior,
+          quantidadeAtual: saldoOrigemAtual,
+        },
+        {
+          usuarioId: usuarioDestinoId,
+          lancadoPorId: req.usuario.id,
+          produtoId,
+          tipoMovimentacao: "entrada",
+          quantidade: quantidadeNumerica,
+          quantidadeAnterior: saldoDestinoAnterior,
+          quantidadeAtual: saldoDestinoAtual,
+        },
+      ],
+      { transaction },
+    );
+
+    await transaction.commit();
+
+    return res.json({
+      message: `${quantidadeNumerica} ${produto.nome} transferido(s) de ${usuarioOrigem.nome} para ${usuarioDestino.nome}`,
+      origem: { usuarioId: usuarioOrigemId, quantidade: saldoOrigemAtual },
+      destino: { usuarioId: usuarioDestinoId, quantidade: saldoDestinoAtual },
+    });
+  } catch (error) {
+    await transaction.rollback();
+    console.error("Erro ao transferir estoque entre usuarios:", error);
+    return res.status(500).json({ error: "Erro ao transferir estoque" });
+  }
+};
+
 export const deletarEstoqueUsuario = async (req, res) => {
   try {
     const { usuarioId, produtoId } = req.params;
