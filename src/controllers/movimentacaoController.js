@@ -2597,29 +2597,54 @@ export const registrarAbastecimentoExtra = async (req, res) => {
       }
     }
 
+    // origemEstoque explícita ("usuario" | "loja") vem do front quando o
+    // usuário escolhe de qual estoque tirar. Sem ela, usa o estoque próprio
+    // se tiver saldo suficiente e cai pro estoque da loja caso contrário.
+    const origemSolicitada = ["usuario", "loja"].includes(
+      req.body?.origemEstoque,
+    )
+      ? req.body.origemEstoque
+      : null;
+
     const usuarioEstoqueId =
       req.usuario?.id || usuarioResponsavelId || movimentacao.usuarioId;
-    const estoqueUsuario = await EstoqueUsuario.findOne({
-      where: {
-        usuarioId: usuarioEstoqueId,
-        produtoId,
-      },
-      transaction,
-      ...lock,
-    });
+    const estoqueUsuarioEncontrado =
+      origemSolicitada === "loja"
+        ? null
+        : await EstoqueUsuario.findOne({
+            where: {
+              usuarioId: usuarioEstoqueId,
+              produtoId,
+            },
+            transaction,
+            ...lock,
+          });
 
-    const estoqueLoja = estoqueUsuario
-      ? null
-      : await EstoqueLoja.findOne({
-          where: {
-            lojaId: maquina.lojaId,
-            produtoId,
-          },
-          transaction,
-          ...lock,
-        });
-    const estoqueOrigem = estoqueUsuario || estoqueLoja;
-    const origemEstoque = estoqueUsuario ? "usuario" : "loja";
+    const usuarioTemSaldo =
+      Number(estoqueUsuarioEncontrado?.quantidade || 0) >= quantidadeExtra;
+    const estoqueUsuario =
+      origemSolicitada === "usuario" ||
+      (estoqueUsuarioEncontrado && usuarioTemSaldo)
+        ? estoqueUsuarioEncontrado
+        : null;
+
+    const estoqueLoja =
+      estoqueUsuario || origemSolicitada === "usuario"
+        ? null
+        : await EstoqueLoja.findOne({
+            where: {
+              lojaId: maquina.lojaId,
+              produtoId,
+            },
+            transaction,
+            ...lock,
+          });
+    // Sem origem explícita e sem linha na loja, mantém o estoque próprio
+    // (mesmo sem saldo) pra devolver "estoque insuficiente" em vez de 404.
+    const estoqueOrigem =
+      estoqueUsuario || estoqueLoja || estoqueUsuarioEncontrado;
+    const origemEstoque =
+      estoqueOrigem && estoqueOrigem === estoqueLoja ? "loja" : "usuario";
 
     if (!estoqueOrigem) {
       return rejeitar(
@@ -2638,8 +2663,8 @@ export const registrarAbastecimentoExtra = async (req, res) => {
       id: estoqueOrigem.id,
       origem: origemEstoque,
       saldoAtual,
-      usuarioId: estoqueUsuario ? usuarioEstoqueId : null,
-      lojaId: estoqueLoja ? maquina.lojaId : null,
+      usuarioId: origemEstoque === "usuario" ? usuarioEstoqueId : null,
+      lojaId: origemEstoque === "loja" ? maquina.lojaId : null,
     };
     console.info("[abastecimento-extra] estoque encontrado", contextoLog);
 

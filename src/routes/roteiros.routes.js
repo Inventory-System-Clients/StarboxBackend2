@@ -985,6 +985,17 @@ router.patch(
         );
       }
 
+      if (update.nome !== undefined) {
+        const nomeNormalizado =
+          typeof update.nome === "string" ? update.nome.trim() : "";
+        if (!nomeNormalizado) {
+          return res
+            .status(400)
+            .json({ error: "O nome do roteiro não pode ficar vazio" });
+        }
+        update.nome = nomeNormalizado;
+      }
+
       if (update.observacao !== undefined) {
         if (typeof update.observacao !== "string") {
           return res
