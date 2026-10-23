@@ -61,6 +61,7 @@ import PecaDefeituosaPendente from "./PecaDefeituosaPendente.js";
 import PecaDefeituosaBase from "./PecaDefeituosaBase.js";
 import BaseSecundariaDashboard from "./BaseSecundariaDashboard.js";
 import AbastecimentoExtra from "./AbastecimentoExtra.js";
+import MaquinaHistoricoLoja from "./MaquinaHistoricoLoja.js";
 Roteiro.associate({ Usuario, Loja, RoteiroLoja, Veiculo });
 Veiculo.hasMany(Roteiro, { foreignKey: "veiculoId", as: "roteiros" });
 // Movimentação de Veículo -> Veículo e Usuário
@@ -558,6 +559,21 @@ Usuario.hasMany(FluxoCaixa, {
   as: "conferenciasCaixa",
 });
 
+Maquina.hasMany(MaquinaHistoricoLoja, {
+  foreignKey: "maquinaId",
+  as: "historicoLojas",
+});
+MaquinaHistoricoLoja.belongsTo(Maquina, {
+  foreignKey: "maquinaId",
+  as: "maquina",
+});
+MaquinaHistoricoLoja.belongsTo(Loja, { foreignKey: "lojaId", as: "loja" });
+MaquinaHistoricoLoja.belongsTo(Usuario, {
+  foreignKey: "usuarioId",
+  as: "usuario",
+  constraints: false,
+});
+
 export {
   CarrinhoPeca,
   Usuario,
@@ -601,4 +617,5 @@ export {
   PecaDefeituosaBase,
   BaseSecundariaDashboard,
   AbastecimentoExtra,
+  MaquinaHistoricoLoja,
 };

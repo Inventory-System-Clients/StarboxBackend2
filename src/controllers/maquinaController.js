@@ -5,8 +5,15 @@ import {
   MovimentacaoProduto,
   GastoFixoLoja,
   RoteiroLoja,
+  MaquinaHistoricoLoja,
+  Usuario,
 } from "../models/index.js";
 import { Op } from "sequelize";
+import {
+  garantirHistoricoInicial,
+  registrarEntradaNoPonto,
+  registrarTrocaDePonto,
+} from "../services/maquinaHistoricoLojaService.js";
 import { parseListParams, buildPaginatedResponse } from "../utils/pagination.js";
 
 const possuiNumero = (valor) =>
@@ -509,6 +516,13 @@ export const criarMaquina = async (req, res) => {
       { transaction },
     );
 
+    await registrarEntradaNoPonto({
+      maquinaId: maquina.id,
+      lojaId: maquina.lojaId,
+      usuarioId: req.usuario?.id || null,
+      transaction,
+    });
+
     const inInicialValido = possuiNumero(contadorInInicial);
     const outInicialValido = possuiNumero(contadorOutInicial);
 
@@ -636,6 +650,8 @@ export const atualizarMaquina = async (req, res) => {
           : codigoAtualizado
         : maquina.nome;
 
+    const lojaIdAnterior = maquina.lojaId;
+
     await maquina.update({
       codigo: codigoAtualizado,
       nome: nomeAtualizado,
@@ -660,10 +676,96 @@ export const atualizarMaquina = async (req, res) => {
       ativo: ativo ?? maquina.ativo,
     });
 
+    if (maquina.lojaId !== lojaIdAnterior) {
+      try {
+        await registrarTrocaDePonto({
+          maquina,
+          lojaIdAnterior,
+          lojaIdNovo: maquina.lojaId,
+          usuarioId: req.usuario?.id || null,
+        });
+      } catch (erroHistorico) {
+        console.error(
+          "Erro ao registrar historico de pontos da maquina:",
+          erroHistorico,
+        );
+      }
+    }
+
     res.json(maquina);
   } catch (error) {
     console.error("Erro ao atualizar máquina:", error);
     res.status(500).json({ error: "Erro ao atualizar máquina" });
+  }
+};
+
+// Historico de pontos (lojas) por onde a maquina ja passou
+export const listarHistoricoPontos = async (req, res) => {
+  try {
+    const busca = String(req.query.busca || "").trim();
+
+    if (!busca) {
+      return res
+        .status(400)
+        .json({ error: "Informe o codigo ou id da maquina para pesquisar" });
+    }
+
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const condicoes = [
+      { codigo: { [Op.iLike]: `%${busca}%` } },
+      { nome: { [Op.iLike]: `%${busca}%` } },
+    ];
+    if (uuidRegex.test(busca)) {
+      condicoes.push({ id: busca });
+    }
+
+    const maquinas = await Maquina.findAll({
+      where: { [Op.or]: condicoes },
+      include: [{ model: Loja, as: "loja", attributes: ["id", "nome", "cidade"] }],
+      order: [["codigo", "ASC"]],
+      limit: 20,
+    });
+
+    for (const maquina of maquinas) {
+      await garantirHistoricoInicial({ maquina });
+    }
+
+    const historicos = await MaquinaHistoricoLoja.findAll({
+      where: { maquinaId: { [Op.in]: maquinas.map((maquina) => maquina.id) } },
+      include: [
+        { model: Loja, as: "loja", attributes: ["id", "nome", "cidade"] },
+        { model: Usuario, as: "usuario", attributes: ["id", "nome"] },
+      ],
+      order: [
+        ["dataEntrada", "DESC"],
+        ["createdAt", "DESC"],
+      ],
+    });
+
+    res.json(
+      maquinas.map((maquina) => ({
+        id: maquina.id,
+        codigo: maquina.codigo,
+        nome: maquina.nome,
+        ativo: maquina.ativo,
+        lojaAtual: maquina.loja,
+        historico: historicos
+          .filter((item) => item.maquinaId === maquina.id)
+          .map((item) => ({
+            id: item.id,
+            loja: item.loja,
+            usuario: item.usuario,
+            dataEntrada: item.dataEntrada,
+            dataSaida: item.dataSaida,
+          })),
+      })),
+    );
+  } catch (error) {
+    console.error("Erro ao listar historico de pontos da maquina:", error);
+    res
+      .status(500)
+      .json({ error: "Erro ao carregar historico de pontos da maquina" });
   }
 };
 
