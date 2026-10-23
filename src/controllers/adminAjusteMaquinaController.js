@@ -78,13 +78,22 @@ const montarRespostaAjusteAtual = ({ maquina, movimentacao, anteriores }) => ({
         cidade: maquina.loja.cidade,
       }
     : null,
-  valoresAtuais: {
-    quantidadeAtual: Number(movimentacao.totalPos || 0),
-    contadorIn: movimentacao.contadorIn,
-    contadorOut: movimentacao.contadorOut,
-    ultimaAtualizacao: movimentacao.dataColeta,
-    atualizadoEm: movimentacao.updatedAt,
-  },
+  semValoresAtuais: !movimentacao,
+  valoresAtuais: movimentacao
+    ? {
+        quantidadeAtual: Number(movimentacao.totalPos || 0),
+        contadorIn: movimentacao.contadorIn,
+        contadorOut: movimentacao.contadorOut,
+        ultimaAtualizacao: movimentacao.dataColeta,
+        atualizadoEm: movimentacao.updatedAt,
+      }
+    : {
+        quantidadeAtual: null,
+        contadorIn: null,
+        contadorOut: null,
+        ultimaAtualizacao: null,
+        atualizadoEm: null,
+      },
   valoresAnteriores: anteriores || null,
   camposEditaveis: ["quantidadeAtual", "contadorIn", "contadorOut"],
 });
@@ -104,13 +113,6 @@ export const obterAjusteAtualMaquina = async (req, res) => {
     const movimentacao = await buscarUltimaMovimentacaoDaMaquina({
       maquinaId,
     });
-
-    if (!movimentacao) {
-      return res.status(404).json({
-        error: "Esta maquina ainda nao possui valores atuais para editar",
-        code: "MAQUINA_SEM_VALORES_ATUAIS",
-      });
-    }
 
     return res.json(
       montarRespostaAjusteAtual({
@@ -185,12 +187,56 @@ export const atualizarAjusteAtualMaquina = async (req, res) => {
     });
 
     if (!movimentacao) {
-      await transaction.rollback();
+      // Sem movimentacao: cria a movimentacao inicial com os contadores informados.
+      if (!contadorInNormalizado.presente || !contadorOutNormalizado.presente) {
+        await transaction.rollback();
+        transaction = null;
+        return res.status(400).json({
+          error:
+            "Para criar o contador inicial, informe contadorIn e contadorOut",
+          code: "MAQUINA_CONTADORES_INICIAIS_OBRIGATORIOS",
+        });
+      }
+
+      const { maquina } = resultadoMaquina;
+      const inInicial = contadorInNormalizado.valor;
+      const outInicial = contadorOutNormalizado.valor;
+      const quantidadeInicial = quantidadeAtualNormalizada.presente
+        ? quantidadeAtualNormalizada.valor
+        : Number(maquina.capacidadePadrao || 0);
+
+      const movimentacaoInicial = await Movimentacao.create(
+        {
+          maquinaId: maquina.id,
+          usuarioId: req.usuario.id,
+          dataColeta: new Date(),
+          totalPre: quantidadeInicial,
+          sairam: 0,
+          abastecidas: 0,
+          fichas: 0,
+          valorFaturado: 0,
+          contadorIn: inInicial,
+          contadorInDigital: inInicial,
+          contadorInAnterior: inInicial,
+          contadorOut: outInicial,
+          contadorOutDigital: outInicial,
+          contadorOutAnterior: outInicial,
+          observacoes: "Movimentacao inicial criada pelo ajuste da maquina",
+          tipoOcorrencia: "Inicial",
+        },
+        { transaction },
+      );
+
+      await transaction.commit();
       transaction = null;
-      return res.status(404).json({
-        error: "Esta maquina ainda nao possui valores atuais para editar",
-        code: "MAQUINA_SEM_VALORES_ATUAIS",
-      });
+
+      res.locals.entityId = maquina.id;
+      return res.status(201).json(
+        montarRespostaAjusteAtual({
+          maquina,
+          movimentacao: movimentacaoInicial,
+        }),
+      );
     }
 
     const anteriores = {
