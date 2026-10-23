@@ -154,6 +154,39 @@ const obterLojaEsperadaPendente = async (roteiroId) => {
   return contexto.find((item) => item.temPendencia) || null;
 };
 
+// Todos os pontos pendentes antes da loja selecionada que ainda não têm
+// justificativa no dia. Uma única justificativa cobre todos eles.
+const obterLojasPuladasSemJustificativa = async (roteiroId, lojaId, data) => {
+  const contextoOrdem = await obterContextoOrdemRoteiro(roteiroId);
+  const indiceDestino = contextoOrdem.findIndex(
+    (item) => normalizarId(item.id) === normalizarId(lojaId),
+  );
+  if (indiceDestino <= 0) return [];
+
+  const lojasPendentesAntes = contextoOrdem
+    .slice(0, indiceDestino)
+    .filter((item) => item.temPendencia);
+  if (lojasPendentesAntes.length === 0) return [];
+
+  const pontos = await RoteiroPontoPulado.findAll({
+    where: {
+      roteiroId,
+      data,
+      lojaId: { [Op.in]: lojasPendentesAntes.map((item) => item.id) },
+    },
+  });
+  const pontoPorLojaId = new Map(
+    pontos.map((item) => [normalizarId(item.lojaId), item]),
+  );
+
+  return lojasPendentesAntes
+    .map((item) => ({
+      ...item,
+      pontoPulado: pontoPorLojaId.get(normalizarId(item.id)) || null,
+    }))
+    .filter((item) => !pontoFoiJustificadoNoDia(item.pontoPulado));
+};
+
 // Criar novo roteiro (aceita diasSemana opcionalmente)
 router.post("/", autenticar, autorizar(ROLES_GESTAO_ROTEIROS), criarRoteiro);
 
@@ -717,56 +750,62 @@ router.post("/:id/justificar-ordem", autenticar, async (req, res) => {
     if (!lojaId)
       return res.status(400).json({ error: "lojaId \u00e9 obrigat\u00f3rio" });
 
-    let lojaEsperadaId = null;
-    let lojaEsperadaNome = null;
-    let lojaNome = null;
-    const contextoOrdem = await obterContextoOrdemRoteiro(roteiroId);
-    const lojaPuladaInfo = lojaPuladaId
-      ? contextoOrdem.find(
-          (item) => normalizarId(item.id) === normalizarId(lojaPuladaId),
-        )
-      : null;
+    const dataHoje = getDataHoje();
 
-    if (lojaPuladaInfo?.temPendencia) {
-      lojaEsperadaId = lojaPuladaInfo.id;
-      lojaEsperadaNome = lojaPuladaInfo.nome;
-    } else {
-      const lojaEsperada = contextoOrdem.find((item) => item.temPendencia);
+    // Uma justificativa cobre todos os pontos pulados até a loja selecionada.
+    let lojasPuladas = await obterLojasPuladasSemJustificativa(
+      roteiroId,
+      lojaId,
+      dataHoje,
+    );
+
+    if (lojasPuladas.length === 0) {
+      const contextoOrdem = await obterContextoOrdemRoteiro(roteiroId);
+      const lojaPuladaInfo = lojaPuladaId
+        ? contextoOrdem.find(
+            (item) => normalizarId(item.id) === normalizarId(lojaPuladaId),
+          )
+        : null;
+      const lojaEsperada = lojaPuladaInfo?.temPendencia
+        ? lojaPuladaInfo
+        : contextoOrdem.find((item) => item.temPendencia);
       if (lojaEsperada) {
-        lojaEsperadaId = lojaEsperada.id;
-        lojaEsperadaNome = lojaEsperada.nome;
+        const pontoPulado = await RoteiroPontoPulado.findOne({
+          where: { roteiroId, lojaId: lojaEsperada.id, data: dataHoje },
+        });
+        lojasPuladas = [{ ...lojaEsperada, pontoPulado }];
       }
     }
 
+    const lojaEsperadaId = lojasPuladas[0]?.id || null;
+    const lojaEsperadaNome =
+      lojasPuladas.map((item) => item.nome).join(", ") || null;
+
     // Nome da loja visitada
     const lojaSelecionada = await Loja.findByPk(lojaId);
-    lojaNome = lojaSelecionada ? lojaSelecionada.nome : null;
+    const lojaNome = lojaSelecionada ? lojaSelecionada.nome : null;
 
-    await LogOrdemRoteiro.create({
-      roteiroId,
-      lojaId,
-      usuarioId,
-      lojaEsperadaId,
-      lojaSelecionadaId: lojaId,
-      justificativa: justificativa.trim(),
-      lojaEsperadaNome,
-      lojaNome,
-    });
-
-    const dataHoje = getDataHoje();
-    if (lojaEsperadaId) {
-      const pontoPulado = await RoteiroPontoPulado.findOne({
-        where: {
-          roteiroId,
-          lojaId: lojaEsperadaId,
-          data: dataHoje,
-        },
+    const logs = lojasPuladas.length > 0 ? lojasPuladas : [null];
+    for (const lojaPulada of logs) {
+      await LogOrdemRoteiro.create({
+        roteiroId,
+        lojaId,
+        usuarioId,
+        lojaEsperadaId: lojaPulada?.id || null,
+        lojaSelecionadaId: lojaId,
+        justificativa: justificativa.trim(),
+        lojaEsperadaNome: lojaPulada?.nome || null,
+        lojaNome,
       });
+    }
+
+    for (const lojaPulada of lojasPuladas) {
+      const { pontoPulado } = lojaPulada;
 
       if (!pontoPulado) {
         await RoteiroPontoPulado.create({
           roteiroId,
-          lojaId: lojaEsperadaId,
+          lojaId: lojaPulada.id,
           data: dataHoje,
           foiPulado: true,
           justificativaEnviada: true,
@@ -804,6 +843,7 @@ router.post("/:id/justificar-ordem", autenticar, async (req, res) => {
       message: "Justificativa registrada com sucesso",
       lojaEsperadaId,
       lojaEsperadaNome,
+      lojasPuladas: lojasPuladas.map(({ id, nome }) => ({ id, nome })),
       lojaId,
       lojaNome,
       justificativa: justificativa.trim(),
@@ -825,75 +865,28 @@ router.get("/:id/quebra-ordem/status", autenticar, async (req, res) => {
     }
 
     const dataHoje = getDataHoje();
-    const contextoOrdem = await obterContextoOrdemRoteiro(roteiroId);
-    const idsOrdenados = contextoOrdem.map((item) => normalizarId(item.id));
-    const idDestino = normalizarId(lojaId);
-    const idAtual = normalizarId(lojaAtualId);
 
-    if (idAtual) {
-      const indiceAtual = idsOrdenados.indexOf(idAtual);
-      const indiceDestino = idsOrdenados.indexOf(idDestino);
+    // Considera todos os pontos pendentes antes da loja selecionada: se algum
+    // ainda não foi justificado, pede UMA justificativa cobrindo todos.
+    const lojasPuladas = await obterLojasPuladasSemJustificativa(
+      roteiroId,
+      lojaId,
+      dataHoje,
+    );
 
-      if (indiceAtual >= 0 && indiceDestino >= 0 && indiceDestino > indiceAtual + 1) {
-        const lojasIntermediarias = contextoOrdem.slice(
-          indiceAtual + 1,
-          indiceDestino,
-        );
-
-        const lojasIntermediariasComPendencia = lojasIntermediarias.filter(
-          (item) => item.temPendencia,
-        );
-
-        const pontosIntermediarios =
-          lojasIntermediariasComPendencia.length > 0
-            ? await RoteiroPontoPulado.findAll({
-                where: {
-                  roteiroId,
-                  data: dataHoje,
-                  lojaId: {
-                    [Op.in]: lojasIntermediariasComPendencia.map((item) => item.id),
-                  },
-                },
-              })
-            : [];
-
-        const pontoIntermediarioPorLojaId = new Map(
-          pontosIntermediarios.map((item) => [normalizarId(item.lojaId), item]),
-        );
-
-        const proximaLojaPuladaSemJustificativa = lojasIntermediariasComPendencia.find(
-          (item) => {
-            const ponto = pontoIntermediarioPorLojaId.get(normalizarId(item.id));
-            return !pontoFoiJustificadoNoDia(ponto);
-          },
-        );
-
-        if (proximaLojaPuladaSemJustificativa) {
-          const pontoPulado = pontoIntermediarioPorLojaId.get(
-            normalizarId(proximaLojaPuladaSemJustificativa.id),
-          );
-
-          return res.json({
-            precisaJustificativa: true,
-            motivo: "loja_pulada_sem_justificativa",
-            lojaEsperadaId: proximaLojaPuladaSemJustificativa.id,
-            lojaEsperadaNome: proximaLojaPuladaSemJustificativa.nome,
-            lojaSelecionadaId: lojaId,
-            lojaSelecionadaNome: null,
-            lojaAtualId: lojaAtualId || null,
-            data: dataHoje,
-            pontoPulado: pontoPulado || null,
-          });
-        }
-
-        return res.json({
-          precisaJustificativa: false,
-          motivo: "ponto_selecionado_ja_justificado",
-          lojaSelecionadaId: lojaId,
-          lojaAtualId: lojaAtualId || null,
-          data: dataHoje,
-        });
-      }
+    if (lojasPuladas.length > 0) {
+      return res.json({
+        precisaJustificativa: true,
+        motivo: "loja_pulada_sem_justificativa",
+        lojaEsperadaId: lojasPuladas[0].id,
+        lojaEsperadaNome: lojasPuladas.map((item) => item.nome).join(", "),
+        lojasPuladas: lojasPuladas.map(({ id, nome }) => ({ id, nome })),
+        lojaSelecionadaId: lojaId,
+        lojaSelecionadaNome: null,
+        lojaAtualId: lojaAtualId || null,
+        data: dataHoje,
+        pontoPulado: lojasPuladas[0].pontoPulado,
+      });
     }
 
     const lojaEsperada = await obterLojaEsperadaPendente(roteiroId);
@@ -913,27 +906,14 @@ router.get("/:id/quebra-ordem/status", autenticar, async (req, res) => {
       });
     }
 
-    const pontoEsperado = await RoteiroPontoPulado.findOne({
-      where: {
-        roteiroId,
-        lojaId: lojaEsperada.id,
-        data: dataHoje,
-      },
-    });
-
-    const justificativaJaEnviada = pontoFoiJustificadoNoDia(pontoEsperado);
-
     return res.json({
-      precisaJustificativa: !justificativaJaEnviada,
-      motivo: justificativaJaEnviada
-        ? "ponto_selecionado_ja_justificado"
-        : "loja_pulada_sem_justificativa",
+      precisaJustificativa: false,
+      motivo: "ponto_selecionado_ja_justificado",
       lojaEsperadaId: lojaEsperada.id,
       lojaEsperadaNome: lojaEsperada.nome,
       lojaSelecionadaId: lojaId,
-      lojaSelecionadaNome: null,
+      lojaAtualId: lojaAtualId || null,
       data: dataHoje,
-      pontoPulado: pontoEsperado || null,
     });
   } catch (error) {
     console.error("Erro ao verificar status de quebra de ordem:", error);
