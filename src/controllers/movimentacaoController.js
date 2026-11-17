@@ -17,6 +17,7 @@ import {
   RoteiroLoja,
   UsuarioLoja,
   AbastecimentoExtra,
+  MovimentacaoPeca,
 } from "../models/index.js";
 import { Op } from "sequelize";
 import { randomUUID } from "node:crypto";
@@ -1798,8 +1799,17 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
     const maquinaIdsComLeitura = new Set(itens.map((item) => String(item.maquinaId)));
     const maquinasDaLoja = await Maquina.findAll({
       where: { lojaId, ...(maquinaId ? { id: maquinaId } : {}) },
-      attributes: ["id", "nome", "codigo"],
+      attributes: ["id", "nome", "codigo", "comissaoLojaPercentual"],
     });
+    // Comissao do ponto vem sempre do cadastro ATUAL da maquina: o resumo
+    // salvo na leitura pode ser anterior ao vinculo da comissao (ou nem ter
+    // o campo), e ai a mensagem saia sem o calculo.
+    const comissaoPorMaquina = new Map(
+      maquinasDaLoja.map((maquina) => [
+        String(maquina.id),
+        Number(maquina.comissaoLojaPercentual || 0),
+      ]),
+    );
     const maquinasSemLeitura = maquinasDaLoja.filter(
       (maquina) => !maquinaIdsComLeitura.has(String(maquina.id)),
     );
@@ -1864,6 +1874,14 @@ export const listarLeiturasWhatsAppDaLoja = async (req, res) => {
       itens.sort(
         (a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0),
       );
+    }
+
+    for (const item of itens) {
+      if (!item.resumo || typeof item.resumo !== "object") continue;
+      const percentual = comissaoPorMaquina.get(String(item.maquinaId));
+      if (percentual !== undefined) {
+        item.resumo = { ...item.resumo, percentualComissao: percentual };
+      }
     }
 
     const itensComAutorDaLeitura = deveExibirSomenteLeiturasDoUsuario
@@ -3105,17 +3123,159 @@ export const deletarAbastecimentoExtra = async (req, res) => {
 
 // Deletar movimentação (apenas ADMIN)
 export const deletarMovimentacao = async (req, res) => {
+  let transaction = null;
   try {
-    const movimentacao = await Movimentacao.findByPk(req.params.id);
+    transaction = await Movimentacao.sequelize.transaction();
+    const movimentacao = await Movimentacao.findByPk(req.params.id, {
+      transaction,
+    });
 
     if (!movimentacao) {
+      await transaction.rollback();
       return res.status(404).json({ error: "Movimentação não encontrada" });
     }
 
-    await movimentacao.destroy();
+    const lock = { lock: transaction.LOCK?.UPDATE };
+    const maquinaMov = await Maquina.findByPk(movimentacao.maquinaId, {
+      attributes: ["id", "lojaId", "nome", "codigo"],
+      transaction,
+    });
+    const lojaIdMov = maquinaMov?.lojaId || null;
+    const itensHistoricoLoja = [];
+
+    const devolverAoEstoque = async ({ origem, usuarioId, produtoId, quantidade }) => {
+      const qtd = Number(quantidade || 0);
+      if (!produtoId || qtd <= 0) return;
+
+      if (origem === "usuario" && usuarioId) {
+        const estoqueUsuario = await EstoqueUsuario.findOne({
+          where: { usuarioId, produtoId },
+          transaction,
+          ...lock,
+        });
+        if (estoqueUsuario) {
+          await estoqueUsuario.update(
+            { quantidade: Number(estoqueUsuario.quantidade || 0) + qtd },
+            { transaction },
+          );
+          return;
+        }
+        // Linha do funcionário não existe mais: cria pra não perder o saldo.
+        await EstoqueUsuario.create(
+          { usuarioId, produtoId, quantidade: qtd },
+          { transaction },
+        );
+        return;
+      }
+
+      if (!lojaIdMov) return;
+      const estoqueLoja = await EstoqueLoja.findOne({
+        where: { lojaId: lojaIdMov, produtoId },
+        transaction,
+        ...lock,
+      });
+      if (estoqueLoja) {
+        await estoqueLoja.update(
+          { quantidade: Number(estoqueLoja.quantidade || 0) + qtd },
+          { transaction },
+        );
+      } else {
+        await EstoqueLoja.create(
+          { lojaId: lojaIdMov, produtoId, quantidade: qtd },
+          { transaction },
+        );
+      }
+      itensHistoricoLoja.push({
+        produtoId,
+        quantidade: qtd,
+        tipoMovimentacao: "entrada",
+      });
+    };
+
+    // 1) Abastecimentos extras: cada um sabe de onde saiu (origemEstoque).
+    const extras = await AbastecimentoExtra.findAll({
+      where: { movimentacaoId: movimentacao.id },
+      transaction,
+    });
+    const extrasPorProduto = new Map();
+    for (const extra of extras) {
+      const qtd = Number(extra.quantidade || 0);
+      await devolverAoEstoque({
+        origem: extra.origemEstoque === "usuario" ? "usuario" : "loja",
+        usuarioId: extra.usuarioId,
+        produtoId: extra.produtoId,
+        quantidade: qtd,
+      });
+      const chave = String(extra.produtoId);
+      extrasPorProduto.set(chave, (extrasPorProduto.get(chave) || 0) + qtd);
+    }
+
+    // 2) Abastecimento da própria leitura: a movimentação não guarda a
+    // origem, então segue a mesma regra da edição (atualizarMovimentacao):
+    // se o funcionário tem linha de estoque do produto, saiu dele; senão,
+    // saiu do estoque do ponto. Os extras já devolvidos acima estão somados
+    // em quantidadeAbastecida, por isso são descontados aqui.
+    const detalhes = await MovimentacaoProduto.findAll({
+      where: { movimentacaoId: movimentacao.id },
+      transaction,
+    });
+    for (const detalhe of detalhes) {
+      const jaDevolvido = extrasPorProduto.get(String(detalhe.produtoId)) || 0;
+      const qtdBase = Math.max(
+        0,
+        Number(detalhe.quantidadeAbastecida || 0) - jaDevolvido,
+      );
+      if (qtdBase <= 0) continue;
+
+      const estoqueDoFuncionario = movimentacao.usuarioId
+        ? await EstoqueUsuario.findOne({
+            where: {
+              usuarioId: movimentacao.usuarioId,
+              produtoId: detalhe.produtoId,
+            },
+            attributes: ["id"],
+            transaction,
+          })
+        : null;
+
+      await devolverAoEstoque({
+        origem: estoqueDoFuncionario ? "usuario" : "loja",
+        usuarioId: movimentacao.usuarioId,
+        produtoId: detalhe.produtoId,
+        quantidade: qtdBase,
+      });
+    }
+
+    if (lojaIdMov && itensHistoricoLoja.length > 0) {
+      await registrarHistoricoEstoqueLoja({
+        lojaId: lojaIdMov,
+        usuarioId: req.usuario?.id,
+        observacao: `Exclusão de movimentação da máquina ${maquinaMov?.nome || maquinaMov?.codigo || maquinaMov?.id}`,
+        itens: itensHistoricoLoja,
+        transaction,
+      });
+    }
+
+    // Remove os registros que apontam pra movimentação antes dela: nem toda
+    // tabela filha tem ON DELETE CASCADE, e sem isso o delete falhava por
+    // chave estrangeira.
+    const where = { movimentacaoId: movimentacao.id };
+    await MovimentacaoProduto.destroy({ where, transaction });
+    await MovimentacaoPeca.destroy({ where, transaction });
+    await AbastecimentoExtra.destroy({ where, transaction });
+    await FluxoCaixa.destroy({ where, transaction });
+    await ValorEsperadoMovimentacao.destroy({ where, transaction });
+
+    await movimentacao.destroy({ transaction });
+    await transaction.commit();
 
     res.json({ message: "Movimentação deletada com sucesso" });
   } catch (error) {
+    if (transaction) {
+      try {
+        await transaction.rollback();
+      } catch {}
+    }
     console.error("Erro ao deletar movimentação:", error);
     res.status(500).json({ error: "Erro ao deletar movimentação" });
   }
